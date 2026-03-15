@@ -1,4 +1,8 @@
-# @prsm/queue
+<p align="center">
+  <img src=".github/logo.svg" width="80" height="80" alt="queue logo">
+</p>
+
+<h1 align="center">@prsm/queue</h1>
 
 Redis-backed distributed task queue with grouped concurrency, retries, and rate limiting.
 
