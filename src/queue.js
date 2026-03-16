@@ -35,8 +35,9 @@ const ACQUIRE_SCRIPT = `
 local key = KEYS[1]
 local max = tonumber(ARGV[1])
 local id = ARGV[2]
-local now = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[3])
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
 if redis.call('ZCARD', key) < max then
   redis.call('ZADD', key, now, id)
@@ -51,8 +52,10 @@ return 1
 `
 
 const RENEW_SCRIPT = `
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
 if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  redis.call('ZADD', KEYS[1], now, ARGV[1])
   return 1
 end
 return 0
@@ -60,6 +63,7 @@ return 0
 
 const LEASE_TTL = 60000
 const HEARTBEAT_INTERVAL = 15000
+const CLOSE_TIMEOUT = 5000
 
 class LocalSemaphore {
   constructor(max) {
@@ -79,7 +83,7 @@ class LocalSemaphore {
   release() {
     if (this._waiting.length > 0) {
       this._waiting.shift()(true)
-    } else {
+    } else if (this._current > 0) {
       this._current--
     }
   }
@@ -114,9 +118,11 @@ export default class Queue extends EventEmitter {
     this._handler = null
     this._workers = new Map()
     this._groupWorkers = new Map()
+    this._groupInFlight = new Map()
     this._workerClients = []
     this._cleanupTimer = null
     this._inFlight = 0
+    this._pushed = 0
     this._totalSettled = 0
     this._closed = false
     this._localSemaphore = new LocalSemaphore(this._options.concurrency)
@@ -148,8 +154,10 @@ export default class Queue extends EventEmitter {
    * @returns {Promise<string>}
    */
   async push(payload) {
+    if (this._closed) throw new Error("Queue is closed")
     const task = { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     await this._redis.lPush("queue:tasks", JSON.stringify(task))
+    this._pushed++
     this.emit("new", { task })
     return task.uuid
   }
@@ -161,11 +169,14 @@ export default class Queue extends EventEmitter {
   group(key) {
     return {
       push: async (payload) => {
+        if (this._closed) throw new Error("Queue is closed")
         const task = { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: key, attempts: 0 }
         await this._redis.lPush(`queue:groups:${key}`, JSON.stringify(task))
+        this._pushed++
         this.emit("new", { task })
         if (!this._groupWorkers.has(key)) {
           this._groupWorkers.set(key, new Map())
+          this._groupInFlight.set(key, 0)
           await this._startGroupWorkers(key)
         }
         return task.uuid
@@ -177,11 +188,26 @@ export default class Queue extends EventEmitter {
   async close() {
     this._closed = true
     await this._readyPromise.catch(() => {})
+
     if (this._cleanupTimer) clearInterval(this._cleanupTimer)
+
     this._workers.clear()
     for (const groupWorkers of this._groupWorkers.values()) groupWorkers.clear()
     this._groupWorkers.clear()
+
     this._localSemaphore.releaseAll()
+
+    if (this._inFlight > 0) {
+      await Promise.race([
+        new Promise((resolve) => {
+          const check = () => { if (this._inFlight <= 0) resolve() }
+          this.on("complete", check)
+          this.on("failed", check)
+        }),
+        new Promise((resolve) => setTimeout(resolve, CLOSE_TIMEOUT)),
+      ])
+    }
+
     for (const [, interval] of this._heartbeats) clearInterval(interval)
     if (this._redis.isOpen && this._activeLeases.size > 0) {
       await Promise.all(
@@ -190,6 +216,7 @@ export default class Queue extends EventEmitter {
     }
     this._heartbeats.clear()
     this._activeLeases.clear()
+
     for (const client of this._workerClients) {
       if (client.isOpen) await client.disconnect()
     }
@@ -236,18 +263,28 @@ export default class Queue extends EventEmitter {
   async _startWorker(workerId) {
     this._workers.set(workerId, true)
     const client = await this._createWorkerClient()
-    this._runWorkerLoop(workerId, client, "queue:tasks", this._workers, (task) => this._processTask(task))
+    const opts = {
+      timeout: this._options.timeout,
+      maxRetries: this._options.maxRetries,
+      retryKey: "queue:tasks",
+    }
+    this._runWorkerLoop(workerId, client, "queue:tasks", this._workers, opts)
   }
 
   async _startGroupWorker(workerId, groupKey) {
     const groupWorkers = this._groupWorkers.get(groupKey)
     const client = await this._createWorkerClient()
-    this._runWorkerLoop(workerId, client, `queue:groups:${groupKey}`, groupWorkers, (task) => this._processGroupTask(task))
+    const opts = {
+      timeout: this._options.groups.timeout,
+      maxRetries: this._options.groups.maxRetries,
+      retryKey: `queue:groups:${groupKey}`,
+      groupKey,
+    }
+    this._runWorkerLoop(workerId, client, `queue:groups:${groupKey}`, groupWorkers, opts)
   }
 
-  async _runWorkerLoop(workerId, client, key, activeMap, processFn) {
-    const isGrouped = key.startsWith("queue:groups:")
-    const delay = isGrouped ? this._options.groups.delay : this._options.delay
+  async _runWorkerLoop(workerId, client, key, activeMap, opts) {
+    const delay = opts.groupKey ? this._options.groups.delay : this._options.delay
 
     while (activeMap.get(workerId)) {
       try {
@@ -258,30 +295,46 @@ export default class Queue extends EventEmitter {
         const task = JSON.parse(taskData.element)
 
         const localAcquired = await this._localSemaphore.acquire()
-        if (!localAcquired) break
-
-        let leaseId = null
-        if (this._options.globalConcurrency > 0) {
-          leaseId = await this._acquireGlobal(workerId, activeMap)
-          if (!leaseId) {
-            this._localSemaphore.release()
-            break
-          }
+        if (!localAcquired) {
+          await this._redis.lPush(key, taskData.element).catch(() => {})
+          break
         }
 
-        this._inFlight++
         try {
-          await processFn(task)
+          let leaseId = null
+          if (this._options.globalConcurrency > 0) {
+            leaseId = await this._acquireGlobal(workerId, activeMap)
+            if (!leaseId) {
+              await this._redis.lPush(key, taskData.element).catch(() => {})
+              break
+            }
+          }
+
+          this._inFlight++
+          if (opts.groupKey) {
+            this._groupInFlight.set(opts.groupKey, (this._groupInFlight.get(opts.groupKey) || 0) + 1)
+          }
+
+          try {
+            await this._processTask(task, opts)
+          } finally {
+            if (opts.groupKey) {
+              const count = (this._groupInFlight.get(opts.groupKey) || 1) - 1
+              if (count <= 0) this._groupInFlight.delete(opts.groupKey)
+              else this._groupInFlight.set(opts.groupKey, count)
+            }
+            if (leaseId) await this._releaseGlobal(leaseId).catch(() => {})
+          }
         } finally {
-          if (leaseId) await this._releaseGlobal(leaseId).catch(() => {})
           this._localSemaphore.release()
         }
 
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
-      } catch (err) {
-        if (err.message?.includes("closed") || err.message?.includes("ClientClosedError")) break
+      } catch {
+        if (this._closed || !client.isOpen) break
       }
     }
+    if (client.isOpen) await client.disconnect().catch(() => {})
   }
 
   async _acquireGlobal(workerId, activeMap) {
@@ -290,7 +343,7 @@ export default class Queue extends EventEmitter {
       if (!this._redis.isOpen) return null
       const acquired = await this._redis.eval(ACQUIRE_SCRIPT, {
         keys: ["queue:active"],
-        arguments: [String(this._options.globalConcurrency), leaseId, String(Date.now()), String(LEASE_TTL)],
+        arguments: [String(this._options.globalConcurrency), leaseId, String(LEASE_TTL)],
       })
       if (acquired) {
         this._activeLeases.add(leaseId)
@@ -323,86 +376,80 @@ export default class Queue extends EventEmitter {
     if (this._redis.isOpen) {
       await this._redis.eval(RENEW_SCRIPT, {
         keys: ["queue:active"],
-        arguments: [leaseId, String(Date.now())],
+        arguments: [leaseId],
       })
     }
   }
 
-  async _processTask(task) {
+  async _processTask(task, opts) {
     task.attempts++
-    try {
-      if (!this._handler) {
-        this.emit("complete", { task, result: undefined })
-        this._settle()
-        return
-      }
-      const timeoutPromise = this._options.timeout > 0
-        ? new Promise((_, reject) => setTimeout(() => reject(new Error("Task timeout")), this._options.timeout))
-        : null
-      const workPromise = Promise.resolve(this._handler(task.payload, task))
-      const result = timeoutPromise ? await Promise.race([workPromise, timeoutPromise]) : await workPromise
-      this.emit("complete", { task, result })
-      this._settle()
-    } catch (error) {
-      if (task.attempts < this._options.maxRetries) {
-        this.emit("retry", { task, error, attempt: task.attempts })
-        this._inFlight--
-        await this._redis.lPush("queue:tasks", JSON.stringify(task))
-      } else {
-        this.emit("failed", { task, error })
-        this._settle()
-      }
-    }
-  }
+    let timer
+    let result
+    let handlerError
+    let succeeded = false
 
-  async _processGroupTask(task) {
-    task.attempts++
-    try {
-      if (!this._handler) {
-        this.emit("complete", { task, result: undefined })
-        this._settle()
-        return
+    if (this._handler) {
+      try {
+        const timeoutPromise = opts.timeout > 0
+          ? new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Task timeout")), opts.timeout) })
+          : null
+        const workPromise = Promise.resolve(this._handler(task.payload, task))
+        result = timeoutPromise ? await Promise.race([workPromise, timeoutPromise]) : await workPromise
+        succeeded = true
+      } catch (err) {
+        handlerError = err
+      } finally {
+        if (timer) clearTimeout(timer)
       }
-      const timeoutPromise = this._options.groups.timeout > 0
-        ? new Promise((_, reject) => setTimeout(() => reject(new Error("Task timeout")), this._options.groups.timeout))
-        : null
-      const workPromise = Promise.resolve(this._handler(task.payload, task))
-      const result = timeoutPromise ? await Promise.race([workPromise, timeoutPromise]) : await workPromise
-      this.emit("complete", { task, result })
+    } else {
+      succeeded = true
+    }
+
+    if (succeeded) {
       this._settle()
-    } catch (error) {
-      if (task.attempts < this._options.groups.maxRetries) {
-        this.emit("retry", { task, error, attempt: task.attempts })
+      try { this.emit("complete", { task, result }) } finally { this._emitDrain() }
+    } else if (task.attempts < opts.maxRetries && !this._closed) {
+      let retried = false
+      try {
+        await this._redis.lPush(opts.retryKey, JSON.stringify(task))
+        retried = true
+      } catch {}
+      if (retried) {
         this._inFlight--
-        await this._redis.lPush(`queue:groups:${task.groupKey}`, JSON.stringify(task))
+        this.emit("retry", { task, error: handlerError, attempt: task.attempts })
       } else {
-        this.emit("failed", { task, error })
         this._settle()
+        try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
       }
+    } else {
+      this._settle()
+      try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
     }
   }
 
   _settle() {
     this._inFlight--
     this._totalSettled++
-    if (this._inFlight === 0 && this._totalSettled > 0) this.emit("drain")
+  }
+
+  _emitDrain() {
+    if (this._inFlight === 0 && this._totalSettled >= this._pushed) this.emit("drain")
   }
 
   async _periodicCleanup() {
     try {
       if (!this._redis.isOpen) return
-      const groupKeys = Array.from(this._groupWorkers.keys())
-      for (const groupKey of groupKeys) {
+      for (const groupKey of Array.from(this._groupWorkers.keys())) {
+        if ((this._groupInFlight.get(groupKey) || 0) > 0) continue
         const length = await this._redis.lLen(`queue:groups:${groupKey}`)
-        if (length === 0) {
-          const keyExists = await this._redis.exists(`queue:groups:${groupKey}`)
-          if (keyExists) await this._redis.del(`queue:groups:${groupKey}`)
-          const groupWorkers = this._groupWorkers.get(groupKey)
-          if (groupWorkers) {
-            groupWorkers.clear()
-            this._groupWorkers.delete(groupKey)
-          }
+        if (length > 0) continue
+        if ((this._groupInFlight.get(groupKey) || 0) > 0) continue
+        const groupWorkers = this._groupWorkers.get(groupKey)
+        if (groupWorkers) {
+          groupWorkers.clear()
+          this._groupWorkers.delete(groupKey)
         }
+        this._groupInFlight.delete(groupKey)
       }
     } catch {}
   }

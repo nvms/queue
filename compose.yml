@@ -12,6 +12,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
 
 volumes:
   queue-redis-data:
