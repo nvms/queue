@@ -15,18 +15,45 @@ function collectEvents(emitter, event) {
   return events
 }
 
+function waitForN(emitter, event, n, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${n} "${event}" events (got ${count})`)), timeout)
+    let count = 0
+    emitter.on(event, (data) => {
+      count++
+      if (count === n) { clearTimeout(timer); resolve() }
+    })
+  })
+}
+
+function waitForNAcross(emitters, event, n, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${n} "${event}" events across emitters (got ${count})`)), timeout)
+    let count = 0
+    for (const emitter of emitters) {
+      emitter.on(event, () => {
+        count++
+        if (count === n) { clearTimeout(timer); resolve() }
+      })
+    }
+  })
+}
+
 describe("Queue", () => {
   let queue
+  let extraQueues = []
   let redis
 
   beforeEach(async () => {
     redis = createClient()
     await redis.connect()
     await redis.flushAll()
+    extraQueues = []
   })
 
   afterEach(async () => {
     if (queue) await queue.close()
+    for (const q of extraQueues) await q.close()
     if (redis) await redis.quit()
   })
 
@@ -138,7 +165,7 @@ describe("Queue", () => {
     })
 
     it("should process grouped tasks with handler", async () => {
-      queue = new Queue({ groups: { concurrency: 1 }, cleanupInterval: 0 })
+      queue = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
 
       const results = []
       let completeCount = 0
@@ -171,8 +198,8 @@ describe("Queue", () => {
       expect(task.groupKey).toBe("retry-group")
     })
 
-    it("should process different groups independently", async () => {
-      queue = new Queue({ groups: { concurrency: 1 }, cleanupInterval: 0 })
+    it("should process different groups concurrently up to local concurrency", async () => {
+      queue = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
 
       let running = 0
       let maxRunning = 0
@@ -184,10 +211,7 @@ describe("Queue", () => {
         return "done"
       })
 
-      let completeCount = 0
-      const allDone = new Promise((resolve) => {
-        queue.on("complete", () => { completeCount++; if (completeCount === 2) resolve() })
-      })
+      const allDone = waitForN(queue, "complete", 2)
 
       await queue.ready()
       await queue.group("g1").push({ id: 1 })
@@ -195,7 +219,6 @@ describe("Queue", () => {
       await allDone
 
       expect(maxRunning).toBe(2)
-      expect(completeCount).toBe(2)
     })
   })
 
@@ -231,10 +254,7 @@ describe("Queue", () => {
         return "done"
       })
 
-      let completeCount = 0
-      const allDone = new Promise((resolve) => {
-        queue.on("complete", () => { completeCount++; if (completeCount === 3) resolve() })
-      })
+      const allDone = waitForN(queue, "complete", 3)
 
       await queue.ready()
       await queue.push({ id: 1 })
@@ -258,10 +278,7 @@ describe("Queue", () => {
         return "done"
       })
 
-      let completeCount = 0
-      const allDone = new Promise((resolve) => {
-        queue.on("complete", () => { completeCount++; if (completeCount === 4) resolve() })
-      })
+      const allDone = waitForN(queue, "complete", 4)
 
       await queue.ready()
       await queue.push({ id: 1 })
@@ -271,7 +288,240 @@ describe("Queue", () => {
       await allDone
 
       expect(maxRunning).toBe(2)
-      expect(completeCount).toBe(4)
+      expect(allDone).toBeDefined()
+    })
+  })
+
+  describe("local concurrency with groups", () => {
+    it("should cap grouped tasks to local concurrency", async () => {
+      queue = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+
+      let running = 0
+      let maxRunning = 0
+      queue.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        running--
+        return "done"
+      })
+
+      const allDone = waitForN(queue, "complete", 5)
+
+      await queue.ready()
+      for (let i = 0; i < 5; i++) {
+        await queue.group(`g${i}`).push({ id: i })
+      }
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(2)
+    })
+
+    it("should cap mixed main queue and group tasks to local concurrency", async () => {
+      queue = new Queue({ concurrency: 3, groups: { concurrency: 1 }, cleanupInterval: 0 })
+
+      let running = 0
+      let maxRunning = 0
+      queue.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        running--
+        return "done"
+      })
+
+      const allDone = waitForN(queue, "complete", 6)
+
+      await queue.ready()
+      await queue.push({ id: "main-1" })
+      await queue.push({ id: "main-2" })
+      await queue.group("g1").push({ id: "group-1" })
+      await queue.group("g2").push({ id: "group-2" })
+      await queue.group("g3").push({ id: "group-3" })
+      await queue.group("g4").push({ id: "group-4" })
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(3)
+    })
+
+    it("should enforce per-group concurrency within local limit", async () => {
+      queue = new Queue({ concurrency: 10, groups: { concurrency: 1 }, cleanupInterval: 0 })
+
+      let running = 0
+      let maxRunning = 0
+      queue.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        running--
+        return "done"
+      })
+
+      const allDone = waitForN(queue, "complete", 3)
+
+      await queue.ready()
+      await queue.group("single").push({ id: 1 })
+      await queue.group("single").push({ id: 2 })
+      await queue.group("single").push({ id: 3 })
+      await allDone
+
+      expect(maxRunning).toBe(1)
+    })
+  })
+
+  describe("global concurrency", () => {
+    it("should enforce global concurrency across queue instances", async () => {
+      const opts = { concurrency: 5, globalConcurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 }
+      queue = new Queue(opts)
+      const queue2 = new Queue(opts)
+      extraQueues.push(queue2)
+
+      let running = 0
+      let maxRunning = 0
+      const handler = async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        running--
+        return "done"
+      }
+
+      queue.process(handler)
+      queue2.process(handler)
+
+      const allDone = waitForNAcross([queue, queue2], "complete", 4)
+
+      await queue.ready()
+      await queue2.ready()
+
+      await queue.group("g1").push({ id: 1 })
+      await queue.group("g2").push({ id: 2 })
+      await queue2.group("g3").push({ id: 3 })
+      await queue2.group("g4").push({ id: 4 })
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(2)
+    })
+
+    it("should enforce global concurrency on the main queue", async () => {
+      const opts = { concurrency: 5, globalConcurrency: 2, cleanupInterval: 0 }
+      queue = new Queue(opts)
+      const queue2 = new Queue(opts)
+      extraQueues.push(queue2)
+
+      let running = 0
+      let maxRunning = 0
+      const handler = async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        running--
+        return "done"
+      }
+
+      queue.process(handler)
+      queue2.process(handler)
+
+      const allDone = waitForNAcross([queue, queue2], "complete", 4)
+
+      await queue.ready()
+      await queue2.ready()
+
+      await queue.push({ id: 1 })
+      await queue.push({ id: 2 })
+      await queue2.push({ id: 3 })
+      await queue2.push({ id: 4 })
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(2)
+    })
+
+    it("should release global slots on close", async () => {
+      queue = new Queue({ concurrency: 5, globalConcurrency: 1, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      queue.process(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        return "done"
+      })
+      await queue.ready()
+
+      const firstDone = waitForEvent(queue, "complete")
+      await queue.group("g1").push({ id: 1 })
+      await firstDone
+      await queue.close()
+      queue = null
+
+      const activeCount = await redis.zCard("queue:active")
+      expect(activeCount).toBe(0)
+
+      queue = new Queue({ concurrency: 5, globalConcurrency: 1, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      queue.process(async () => "second")
+      await queue.ready()
+
+      const secondDone = waitForEvent(queue, "complete")
+      await queue.group("g2").push({ id: 2 })
+      const { result } = await secondDone
+
+      expect(result).toBe("second")
+    })
+  })
+
+  describe("concurrency interaction", () => {
+    it("local concurrency should be the effective cap when lower than global", async () => {
+      queue = new Queue({
+        concurrency: 2,
+        globalConcurrency: 10,
+        groups: { concurrency: 1 },
+        cleanupInterval: 0,
+      })
+
+      let running = 0
+      let maxRunning = 0
+      queue.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        running--
+        return "done"
+      })
+
+      const allDone = waitForN(queue, "complete", 5)
+
+      await queue.ready()
+      for (let i = 0; i < 5; i++) {
+        await queue.group(`g${i}`).push({ id: i })
+      }
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(2)
+    })
+
+    it("global concurrency should be the effective cap when lower than local", async () => {
+      queue = new Queue({
+        concurrency: 10,
+        globalConcurrency: 2,
+        groups: { concurrency: 1 },
+        cleanupInterval: 0,
+      })
+
+      let running = 0
+      let maxRunning = 0
+      queue.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        running--
+        return "done"
+      })
+
+      const allDone = waitForN(queue, "complete", 5)
+
+      await queue.ready()
+      for (let i = 0; i < 5; i++) {
+        await queue.group(`g${i}`).push({ id: i })
+      }
+      await allDone
+
+      expect(maxRunning).toBeLessThanOrEqual(2)
     })
   })
 

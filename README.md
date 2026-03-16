@@ -42,13 +42,14 @@ await queue.push({ userId: 123, action: 'sync' })
 
 ```js
 const queue = new Queue({
-  concurrency: 2,           // worker count
+  concurrency: 2,           // max concurrent tasks per instance
+  globalConcurrency: 10,    // max concurrent tasks across all instances (Redis-backed)
   delay: '100ms',           // pause between tasks (string or ms)
   timeout: '30s',           // max task duration
   maxRetries: 3,            // attempts before failing
 
   groups: {
-    concurrency: 1,         // workers per group
+    concurrency: 1,         // max concurrent tasks per group
     delay: '50ms',
     timeout: '10s',
     maxRetries: 3
@@ -60,6 +61,41 @@ const queue = new Queue({
   }
 })
 ```
+
+## Concurrency
+
+Three independent limits compose together. A task must pass all applicable gates before processing.
+
+**`concurrency`** - per-instance limit. Controls how many tasks this server can process simultaneously. This is the number of worker loops created for the main queue, and also caps total active tasks (including grouped) on this instance via an in-memory semaphore. Default: `1`.
+
+**`globalConcurrency`** - cross-instance limit. Controls how many tasks can run across all servers sharing the same Redis. Uses a Redis-backed semaphore with automatic lease expiry for crash safety. If an instance crashes, its slots are reclaimed after 60 seconds. Default: `0` (disabled).
+
+**`groups.concurrency`** - per-group limit. Controls how many tasks can run concurrently within a single group. Default: `1`.
+
+### Examples
+
+Protect local resources (CPU/memory bound):
+
+```js
+const queue = new Queue({
+  concurrency: 5,
+  groups: { concurrency: 1 }
+})
+```
+
+100 groups each with 1 task - only 5 run at a time on this server.
+
+Protect an external API (shared rate across servers):
+
+```js
+const queue = new Queue({
+  concurrency: 10,
+  globalConcurrency: 20,
+  groups: { concurrency: 2 }
+})
+```
+
+3 servers, each can handle 10 concurrent tasks, but only 20 total across all servers. Each group (tenant) gets up to 2 concurrent slots.
 
 ## Process Handler
 
@@ -74,10 +110,11 @@ Throw an error to trigger retry. After `maxRetries`, the task fails permanently.
 
 ## Grouped Queues
 
-Isolated concurrency per key - perfect for per-tenant rate limiting.
+Isolated concurrency per key - perfect for per-tenant throttling.
 
 ```js
 const queue = new Queue({
+  concurrency: 5,
   groups: { concurrency: 1, delay: '50ms' }
 })
 
@@ -91,7 +128,7 @@ await queue.group('tenant-123').push({ action: 'sync' })
 await queue.group('tenant-456').push({ action: 'sync' })
 ```
 
-Each tenant processes independently. One slow tenant won't block others.
+Each tenant processes independently. One slow tenant won't block others. Total concurrent tasks across all tenants is capped by `concurrency`.
 
 ## Events
 
@@ -115,13 +152,14 @@ queue.on('drain', () => {})
 }
 ```
 
-## Rate Limiting Example
+## Throttling Example
 
-20 LLM calls/sec per tenant:
+Throttle LLM calls to external providers per tenant:
 
 ```js
 const queue = new Queue({
-  groups: { concurrency: 20, delay: '50ms' },
+  concurrency: 20,
+  groups: { concurrency: 2, delay: '50ms' },
   maxRetries: 3
 })
 
@@ -136,6 +174,8 @@ app.post('/api/generate', async (req, res) => {
 })
 ```
 
+Each tenant gets up to 2 concurrent LLM calls with a 50ms pause between them. Total concurrent calls across all tenants is capped at 20, protecting your server and API budget from any single tenant overwhelming the system.
+
 ## WebSocket Integration with [mesh](https://github.com/nvms/mesh)
 
 Queue events are local-only - only the server that processes a task emits `complete`/`failed`. Use [mesh](https://github.com/nvms/mesh) to push results to connected clients in real time.
@@ -147,7 +187,7 @@ import Queue from '@prsm/queue'
 import { MeshServer } from '@mesh-kit/server'
 
 const mesh = new MeshServer({ redis: { host: 'localhost', port: 6379 } })
-const queue = new Queue({ groups: { concurrency: 1 } })
+const queue = new Queue({ concurrency: 5, groups: { concurrency: 1 } })
 
 queue.process(async (payload) => {
   return await generateReport(payload)
@@ -177,7 +217,7 @@ Both queue and mesh use the same Redis instance. No key conflicts (`queue:*` vs 
 
 ## Horizontal Scaling
 
-Multiple servers can push to the same queue. Redis coordinates via atomic operations - no duplicate processing.
+Multiple servers can push to the same queue. Redis coordinates via atomic operations - no duplicate processing. Use `globalConcurrency` to enforce a hard limit across all instances.
 
 ## Cleanup
 

@@ -5,7 +5,8 @@ import ms from "@prsm/ms"
 
 /**
  * @typedef {Object} QueueOptions
- * @property {number} [concurrency] - worker count (default 1)
+ * @property {number} [concurrency] - max concurrent tasks per instance (default 1)
+ * @property {number} [globalConcurrency] - max concurrent tasks across all instances, Redis-backed (default 0, disabled)
  * @property {number|string} [delay] - pause between tasks, ms or string like "100ms" (default 0)
  * @property {number|string} [timeout] - max task duration, ms or string like "30s" (default 0, no limit)
  * @property {number} [maxRetries] - attempts before failing (default 3)
@@ -30,6 +31,65 @@ import ms from "@prsm/ms"
  * @returns {Promise<any>|any}
  */
 
+const ACQUIRE_SCRIPT = `
+local key = KEYS[1]
+local max = tonumber(ARGV[1])
+local id = ARGV[2]
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
+if redis.call('ZCARD', key) < max then
+  redis.call('ZADD', key, now, id)
+  return 1
+end
+return 0
+`
+
+const RELEASE_SCRIPT = `
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1
+`
+
+const RENEW_SCRIPT = `
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  return 1
+end
+return 0
+`
+
+const LEASE_TTL = 60000
+const HEARTBEAT_INTERVAL = 15000
+
+class LocalSemaphore {
+  constructor(max) {
+    this._max = max
+    this._current = 0
+    this._waiting = []
+  }
+
+  acquire() {
+    if (this._current < this._max) {
+      this._current++
+      return Promise.resolve(true)
+    }
+    return new Promise((resolve) => this._waiting.push(resolve))
+  }
+
+  release() {
+    if (this._waiting.length > 0) {
+      this._waiting.shift()(true)
+    } else {
+      this._current--
+    }
+  }
+
+  releaseAll() {
+    for (const resolve of this._waiting) resolve(false)
+    this._waiting = []
+  }
+}
+
 export default class Queue extends EventEmitter {
   /** @param {QueueOptions} [options] */
   constructor(options = {}) {
@@ -37,11 +97,12 @@ export default class Queue extends EventEmitter {
 
     this._options = {
       concurrency: options.concurrency ?? 1,
+      globalConcurrency: options.globalConcurrency ?? 0,
       delay: ms(options.delay ?? 0),
       timeout: ms(options.timeout ?? 0),
       maxRetries: options.maxRetries ?? 3,
       groups: {
-        concurrency: options.groups?.concurrency ?? options.concurrency ?? 1,
+        concurrency: options.groups?.concurrency ?? 1,
         delay: ms(options.groups?.delay ?? options.delay ?? 0),
         timeout: ms(options.groups?.timeout ?? options.timeout ?? 0),
         maxRetries: options.groups?.maxRetries ?? options.maxRetries ?? 3,
@@ -57,6 +118,10 @@ export default class Queue extends EventEmitter {
     this._cleanupTimer = null
     this._inFlight = 0
     this._totalSettled = 0
+    this._closed = false
+    this._localSemaphore = new LocalSemaphore(this._options.concurrency)
+    this._activeLeases = new Set()
+    this._heartbeats = new Map()
 
     this._redis = createClient(this._options.redisOptions)
     this._redis.on("error", () => {})
@@ -110,11 +175,21 @@ export default class Queue extends EventEmitter {
 
   /** @returns {Promise<void>} */
   async close() {
+    this._closed = true
     await this._readyPromise.catch(() => {})
     if (this._cleanupTimer) clearInterval(this._cleanupTimer)
     this._workers.clear()
     for (const groupWorkers of this._groupWorkers.values()) groupWorkers.clear()
     this._groupWorkers.clear()
+    this._localSemaphore.releaseAll()
+    for (const [, interval] of this._heartbeats) clearInterval(interval)
+    if (this._redis.isOpen && this._activeLeases.size > 0) {
+      await Promise.all(
+        Array.from(this._activeLeases).map((id) => this._releaseGlobal(id).catch(() => {}))
+      )
+    }
+    this._heartbeats.clear()
+    this._activeLeases.clear()
     for (const client of this._workerClients) {
       if (client.isOpen) await client.disconnect()
     }
@@ -178,15 +253,78 @@ export default class Queue extends EventEmitter {
       try {
         if (!client.isOpen) break
         const taskData = await client.brPop(key, 1)
-        if (taskData) {
-          const task = JSON.parse(taskData.element)
-          this._inFlight++
-          await processFn(task)
+        if (!taskData) continue
+
+        const task = JSON.parse(taskData.element)
+
+        const localAcquired = await this._localSemaphore.acquire()
+        if (!localAcquired) break
+
+        let leaseId = null
+        if (this._options.globalConcurrency > 0) {
+          leaseId = await this._acquireGlobal(workerId, activeMap)
+          if (!leaseId) {
+            this._localSemaphore.release()
+            break
+          }
         }
+
+        this._inFlight++
+        try {
+          await processFn(task)
+        } finally {
+          if (leaseId) await this._releaseGlobal(leaseId).catch(() => {})
+          this._localSemaphore.release()
+        }
+
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
       } catch (err) {
         if (err.message?.includes("closed") || err.message?.includes("ClientClosedError")) break
       }
+    }
+  }
+
+  async _acquireGlobal(workerId, activeMap) {
+    const leaseId = randomUUID()
+    while (activeMap.get(workerId) && !this._closed) {
+      if (!this._redis.isOpen) return null
+      const acquired = await this._redis.eval(ACQUIRE_SCRIPT, {
+        keys: ["queue:active"],
+        arguments: [String(this._options.globalConcurrency), leaseId, String(Date.now()), String(LEASE_TTL)],
+      })
+      if (acquired) {
+        this._activeLeases.add(leaseId)
+        const heartbeat = setInterval(() => this._renewGlobal(leaseId).catch(() => {}), HEARTBEAT_INTERVAL)
+        heartbeat.unref()
+        this._heartbeats.set(leaseId, heartbeat)
+        return leaseId
+      }
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    return null
+  }
+
+  async _releaseGlobal(leaseId) {
+    this._activeLeases.delete(leaseId)
+    const heartbeat = this._heartbeats.get(leaseId)
+    if (heartbeat) {
+      clearInterval(heartbeat)
+      this._heartbeats.delete(leaseId)
+    }
+    if (this._redis.isOpen) {
+      await this._redis.eval(RELEASE_SCRIPT, {
+        keys: ["queue:active"],
+        arguments: [leaseId],
+      })
+    }
+  }
+
+  async _renewGlobal(leaseId) {
+    if (this._redis.isOpen) {
+      await this._redis.eval(RENEW_SCRIPT, {
+        keys: ["queue:active"],
+        arguments: [leaseId, String(Date.now())],
+      })
     }
   }
 
