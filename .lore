@@ -1,11 +1,11 @@
 -- grouped queues --
 
-the killer feature is grouped concurrency. queue.group(key) gives each key
-its own isolated queue with its own concurrency/delay settings. perfect for
-per-tenant rate limiting.
+the killer feature is grouped concurrency. pass { group: key } as the second
+arg to push/pushAndWait. each group gets its own isolated queue with its own
+concurrency/delay settings. perfect for per-tenant rate limiting.
 
 ```js
-await queue.group('tenant-123').push({ action: 'sync' })
+await queue.push({ action: 'sync' }, { group: 'tenant-123' })
 ```
 
 with concurrency: 1 per group, only one task per tenant runs at a time.
@@ -28,7 +28,7 @@ common pattern: include a connectionId in the task payload, then use
 mesh.sendTo() on completion to deliver results to the specific client:
 
 ```js
-await queue.group(tenantId).push({ connectionId, action: 'generate' })
+await queue.push({ connectionId, action: 'generate' }, { group: tenantId })
 
 queue.on('complete', ({ task, result }) => {
   mesh.sendTo(task.payload.connectionId, 'job:complete', result)

@@ -151,14 +151,17 @@ export default class Queue extends EventEmitter {
 
   /**
    * @param {any} payload
+   * @param {{ group?: string }} [options]
    * @returns {Promise<string>}
    */
-  async push(payload) {
+  async push(payload, { group } = {}) {
     if (this._closed) throw new Error("Queue is closed")
-    const task = { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+    const task = group
+      ? { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: group, attempts: 0 }
+      : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     this._pushed++
     try {
-      await this._redis.lPush("queue:tasks", JSON.stringify(task))
+      await this._enqueue(task, group)
     } catch (err) {
       this._pushed--
       throw err
@@ -169,16 +172,18 @@ export default class Queue extends EventEmitter {
 
   /**
    * @param {any} payload
-   * @param {number|string} [timeout] - max time to wait for result, ms or string like "30s" (default 0, no limit)
+   * @param {{ group?: string, timeout?: number|string }} [options]
    * @returns {Promise<any>}
    */
-  pushAndWait(payload, timeout = 0) {
+  pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) return Promise.reject(new Error("Queue is closed"))
-    const task = { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+    const task = group
+      ? { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: group, attempts: 0 }
+      : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     this._pushed++
     const result = this._awaitTask(task.uuid, timeout)
     result.catch(() => {})
-    return this._redis.lPush("queue:tasks", JSON.stringify(task)).then(() => {
+    return this._enqueue(task, group).then(() => {
       this.emit("new", { task })
       return result
     }, (err) => {
@@ -187,44 +192,17 @@ export default class Queue extends EventEmitter {
     })
   }
 
-  /**
-   * @param {string} key
-   * @returns {{ push: (payload: any) => Promise<string>, pushAndWait: (payload: any, timeout?: number|string) => Promise<any> }}
-   */
-  group(key) {
-    const makeTask = (payload) => {
-      if (this._closed) throw new Error("Queue is closed")
-      return { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: key, attempts: 0 }
-    }
-
-    const commit = (task) => {
-      return this._redis.lPush(`queue:groups:${key}`, JSON.stringify(task)).then(async () => {
-        this.emit("new", { task })
-        if (!this._groupWorkers.has(key)) {
-          this._groupWorkers.set(key, new Map())
-          this._groupInFlight.set(key, 0)
-          await this._startGroupWorkers(key)
-        }
-      }, (err) => {
-        this._pushed--
-        throw err
-      })
-    }
-
-    return {
-      push: async (payload) => {
-        const task = makeTask(payload)
-        this._pushed++
-        await commit(task)
-        return task.uuid
-      },
-      pushAndWait: (payload, timeout = 0) => {
-        const task = makeTask(payload)
-        this._pushed++
-        const result = this._awaitTask(task.uuid, timeout)
-        result.catch(() => {})
-        return commit(task).then(() => result)
-      },
+  /** @private */
+  async _enqueue(task, group) {
+    if (group) {
+      await this._redis.lPush(`queue:groups:${group}`, JSON.stringify(task))
+      if (!this._groupWorkers.has(group)) {
+        this._groupWorkers.set(group, new Map())
+        this._groupInFlight.set(group, 0)
+        await this._startGroupWorkers(group)
+      }
+    } else {
+      await this._redis.lPush("queue:tasks", JSON.stringify(task))
     }
   }
 

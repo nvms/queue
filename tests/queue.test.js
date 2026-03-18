@@ -184,7 +184,7 @@ describe("Queue", () => {
       await queue.ready()
 
       const newPromise = waitForEvent(queue, "new")
-      const uuid = await queue.group("test-group").push({ message: "grouped test" })
+      const uuid = await queue.push({ message: "grouped test" }, { group: "test-group" })
       const { task } = await newPromise
 
       expect(uuid).toBeDefined()
@@ -200,8 +200,8 @@ describe("Queue", () => {
 
       const bothDone = waitForN(queue, "complete", 2)
       await queue.ready()
-      await queue.group("tenant-1").push({ id: "a" })
-      await queue.group("tenant-1").push({ id: "b" })
+      await queue.push({ id: "a" }, { group: "tenant-1" })
+      await queue.push({ id: "b" }, { group: "tenant-1" })
       await bothDone
 
       expect(results).toContain("a")
@@ -215,7 +215,7 @@ describe("Queue", () => {
 
       const failedPromise = waitForEvent(queue, "failed")
       await queue.ready()
-      await queue.group("retry-group").push({ message: "test" })
+      await queue.push({ message: "test" }, { group: "retry-group" })
       const { task } = await failedPromise
 
       expect(attempts).toBe(2)
@@ -236,8 +236,8 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 2)
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
       await allDone
 
       expect(maxRunning).toBe(2)
@@ -267,7 +267,7 @@ describe("Queue", () => {
 
       const failedPromise = waitForEvent(queue, "failed")
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       const { error } = await failedPromise
 
       expect(error.message).toBe("Task timeout")
@@ -309,7 +309,7 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 5)
       await queue.ready()
-      for (let i = 0; i < 5; i++) await queue.group(`g${i}`).push({ id: i })
+      for (let i = 0; i < 5; i++) await queue.push({ id: i }, { group: `g${i}` })
       await allDone
 
       expect(maxRunning).toBeLessThanOrEqual(2)
@@ -331,10 +331,10 @@ describe("Queue", () => {
       await queue.ready()
       await queue.push({ id: "main-1" })
       await queue.push({ id: "main-2" })
-      await queue.group("g1").push({ id: "group-1" })
-      await queue.group("g2").push({ id: "group-2" })
-      await queue.group("g3").push({ id: "group-3" })
-      await queue.group("g4").push({ id: "group-4" })
+      await queue.push({ id: "group-1" }, { group: "g1" })
+      await queue.push({ id: "group-2" }, { group: "g2" })
+      await queue.push({ id: "group-3" }, { group: "g3" })
+      await queue.push({ id: "group-4" }, { group: "g4" })
       await allDone
 
       expect(maxRunning).toBeLessThanOrEqual(3)
@@ -354,9 +354,9 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 3)
       await queue.ready()
-      await queue.group("single").push({ id: 1 })
-      await queue.group("single").push({ id: 2 })
-      await queue.group("single").push({ id: 3 })
+      await queue.push({ id: 1 }, { group: "single" })
+      await queue.push({ id: 2 }, { group: "single" })
+      await queue.push({ id: 3 }, { group: "single" })
       await allDone
 
       expect(maxRunning).toBe(1)
@@ -386,10 +386,10 @@ describe("Queue", () => {
       await queue.ready()
       await queue2.ready()
 
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
-      await queue2.group("g3").push({ id: 3 })
-      await queue2.group("g4").push({ id: 4 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
+      await queue2.push({ id: 3 }, { group: "g3" })
+      await queue2.push({ id: 4 }, { group: "g4" })
       await allDone
 
       expect(maxRunning).toBeLessThanOrEqual(2)
@@ -435,7 +435,7 @@ describe("Queue", () => {
       await queue.ready()
 
       const firstDone = waitForEvent(queue, "complete")
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       await firstDone
       await queue.close()
       queue = null
@@ -448,7 +448,7 @@ describe("Queue", () => {
       await queue.ready()
 
       const secondDone = waitForEvent(queue, "complete")
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 2 }, { group: "g2" })
       const { result } = await secondDone
 
       expect(result).toBe("second")
@@ -468,7 +468,7 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 5)
       await queue.ready()
-      for (let i = 0; i < 5; i++) await queue.group(`g${i}`).push({ id: i })
+      for (let i = 0; i < 5; i++) await queue.push({ id: i }, { group: `g${i}` })
       await allDone
 
       expect(maxRunning).toBeLessThanOrEqual(2)
@@ -488,7 +488,7 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 5)
       await queue.ready()
-      for (let i = 0; i < 5; i++) await queue.group(`g${i}`).push({ id: i })
+      for (let i = 0; i < 5; i++) await queue.push({ id: i }, { group: `g${i}` })
       await allDone
 
       expect(maxRunning).toBeLessThanOrEqual(2)
@@ -502,12 +502,12 @@ describe("Queue", () => {
 
       const failedPromise = waitForEvent(queue, "failed")
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       await failedPromise
 
       queue.process(async () => "recovered")
       const completeDone = waitForEvent(queue, "complete")
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 2 }, { group: "g2" })
       const { result } = await completeDone
       expect(result).toBe("recovered")
     })
@@ -518,12 +518,12 @@ describe("Queue", () => {
 
       const failedPromise = waitForEvent(queue, "failed")
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       await failedPromise
 
       queue.process(async () => "after-timeout")
       const completeDone = waitForEvent(queue, "complete")
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 2 }, { group: "g2" })
       const { result } = await completeDone
       expect(result).toBe("after-timeout")
     })
@@ -534,12 +534,12 @@ describe("Queue", () => {
 
       const failedPromise = waitForEvent(queue, "failed")
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       await failedPromise
 
       queue.process(async () => "recovered")
       const completeDone = waitForEvent(queue, "complete")
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 2 }, { group: "g2" })
       const { result } = await completeDone
       expect(result).toBe("recovered")
     })
@@ -643,8 +643,8 @@ describe("Queue", () => {
       })
       await queue.ready()
 
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
       await new Promise((r) => setTimeout(r, 50))
 
       await queue.close()
@@ -655,7 +655,7 @@ describe("Queue", () => {
       await queue.ready()
 
       const done = waitForEvent(queue, "complete")
-      await queue.group("g3").push({ id: 3 })
+      await queue.push({ id: 3 }, { group: "g3" })
       const { result } = await done
       expect(result).toBe("after-close")
     })
@@ -668,7 +668,7 @@ describe("Queue", () => {
       })
       await queue.ready()
 
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       await new Promise((r) => setTimeout(r, 50))
 
       await queue.close()
@@ -679,7 +679,7 @@ describe("Queue", () => {
       await queue.ready()
 
       const done = waitForEvent(queue, "complete")
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 2 }, { group: "g2" })
       const { result } = await done
       expect(result).toBe("after-close")
     })
@@ -691,9 +691,9 @@ describe("Queue", () => {
       })
       await queue.ready()
 
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
-      await queue.group("g3").push({ id: 3 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
+      await queue.push({ id: 3 }, { group: "g3" })
 
       await new Promise((r) => setTimeout(r, 100))
       await queue.close()
@@ -714,8 +714,8 @@ describe("Queue", () => {
       })
       await queue.ready()
 
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
 
       await new Promise((r) => setTimeout(r, 100))
       await queue.close()
@@ -731,7 +731,7 @@ describe("Queue", () => {
       await queue.close()
 
       await expect(queue.push({ id: 1 })).rejects.toThrow("Queue is closed")
-      await expect(queue.group("g1").push({ id: 1 })).rejects.toThrow("Queue is closed")
+      await expect(queue.push({ id: 1 }, { group: "g1" })).rejects.toThrow("Queue is closed")
 
       queue = null
     })
@@ -769,8 +769,8 @@ describe("Queue", () => {
       await queue.ready()
 
       const drainPromise = waitForEvent(queue, "drain")
-      await queue.group("g1").push({ id: 1 })
-      await queue.group("g2").push({ id: 2 })
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g2" })
       await drainPromise
 
       expect(queue.inFlight).toBe(0)
@@ -858,7 +858,7 @@ describe("Queue", () => {
 
       const completePromise = waitForEvent(queue, "complete")
       await queue.ready()
-      await queue.group("g1").push({ id: 1 })
+      await queue.push({ id: 1 }, { group: "g1" })
       const { result } = await completePromise
 
       expect(result).toBe("success")
@@ -889,7 +889,7 @@ describe("Queue", () => {
       queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
       await queue.ready()
 
-      await expect(queue.pushAndWait({ id: 1 }, 50)).rejects.toThrow("pushAndWait timed out")
+      await expect(queue.pushAndWait({ id: 1 }, { timeout: 50 })).rejects.toThrow("pushAndWait timed out")
     })
 
     it("should accept duration strings for timeout", async () => {
@@ -897,7 +897,7 @@ describe("Queue", () => {
       queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
       await queue.ready()
 
-      await expect(queue.pushAndWait({ id: 1 }, "50ms")).rejects.toThrow("pushAndWait timed out")
+      await expect(queue.pushAndWait({ id: 1 }, { timeout: "50ms" })).rejects.toThrow("pushAndWait timed out")
     })
 
     it("should resolve the correct task when multiple are in flight", async () => {
@@ -924,7 +924,7 @@ describe("Queue", () => {
       queue.process(async (payload) => `processed-${payload.id}`)
       await queue.ready()
 
-      const result = await queue.group("tenant-1").pushAndWait({ id: "a" })
+      const result = await queue.pushAndWait({ id: "a" }, { group: "tenant-1" })
       expect(result).toBe("processed-a")
     })
 
@@ -933,7 +933,7 @@ describe("Queue", () => {
       queue.process(async () => { throw new Error("group boom") })
       await queue.ready()
 
-      await expect(queue.group("g1").pushAndWait({ id: 1 })).rejects.toThrow("group boom")
+      await expect(queue.pushAndWait({ id: 1 }, { group: "g1" })).rejects.toThrow("group boom")
     })
 
     it("should resolve after retries succeed", async () => {
@@ -967,9 +967,9 @@ describe("Queue", () => {
 
       const allDone = waitForN(queue, "complete", 3)
       await queue.ready()
-      await queue.group("single").push({ id: 1 })
-      await queue.group("single").push({ id: 2 })
-      await queue.group("single").push({ id: 3 })
+      await queue.push({ id: 1 }, { group: "single" })
+      await queue.push({ id: 2 }, { group: "single" })
+      await queue.push({ id: 3 }, { group: "single" })
       await allDone
 
       expect(maxRunning).toBe(1)

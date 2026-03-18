@@ -1,6 +1,6 @@
 {
   "name": "@prsm/queue",
-  "version": "2.1.1",
+  "version": "3.0.0",
   "description": "Redis-backed distributed task queue with grouped concurrency, retries, and rate limiting",
   "type": "module",
   "exports": {

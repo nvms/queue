@@ -110,7 +110,7 @@ Throw an error to trigger retry. After `maxRetries`, the task fails permanently.
 
 ## Grouped Queues
 
-Isolated concurrency per key - perfect for per-tenant throttling.
+Isolated concurrency per key - perfect for per-tenant throttling. Pass `{ group }` as the second argument to `push` or `pushAndWait`.
 
 ```js
 const queue = new Queue({
@@ -124,11 +124,11 @@ queue.process(async (payload) => {
 
 await queue.ready()
 
-await queue.group('tenant-123').push({ action: 'sync' })
-await queue.group('tenant-456').push({ action: 'sync' })
+await queue.push({ action: 'sync' }, { group: 'tenant-123' })
+await queue.push({ action: 'sync' }, { group: 'tenant-456' })
 ```
 
-Each tenant processes independently. One slow tenant won't block others. Total concurrent tasks across all tenants is capped by `concurrency`.
+Each tenant processes independently. One slow tenant won't block others. Total concurrent tasks across all tenants is capped by `concurrency`. When the group is conditional, just omit the option - no branching needed.
 
 ## Events
 
@@ -147,7 +147,7 @@ queue.on('drain', () => {})
   uuid: string,
   payload: any,
   createdAt: number,
-  groupKey?: string,  // present when pushed via group()
+  groupKey?: string,  // present when pushed with { group }
   attempts: number
 }
 ```
@@ -169,7 +169,7 @@ queue.process(async ({ prompt }) => {
 
 app.post('/api/generate', async (req, res) => {
   const { tenantId, prompt } = req.body
-  const taskId = await queue.group(tenantId).push({ prompt })
+  const taskId = await queue.push({ prompt }, { group: tenantId })
   res.json({ queued: true, taskId })
 })
 ```
@@ -202,10 +202,10 @@ queue.on('failed', ({ task, error }) => {
 })
 
 mesh.exposeCommand('generate-report', async (ctx) => {
-  const taskId = await queue.group(ctx.connection.id).push({
+  const taskId = await queue.push({
     connectionId: ctx.connection.id,
     ...ctx.payload,
-  })
+  }, { group: ctx.connection.id })
   return { queued: true, taskId }
 })
 
