@@ -1,65 +1,7 @@
--- grouped queues --
+-- gotchas --
 
-the killer feature is grouped concurrency. pass { group: key } as the second
-arg to push/pushAndWait. each group gets its own isolated queue with its own
-concurrency/delay settings. perfect for per-tenant rate limiting.
-
-```js
-await queue.push({ action: 'sync' }, { group: 'tenant-123' })
-```
-
-with concurrency: 1 per group, only one task per tenant runs at a time.
-different tenants process in parallel.
-
--- horizontal scaling --
-
-multiple server instances can push to the same queue. redis coordinates via
-atomic brPop. tasks are processed exactly once (no duplicates).
-
-events are LOCAL only - only the processing server emits complete/failed.
-for distributed events, use redis pub/sub or mesh-kit broadcasting.
-
--- integration with mesh-kit --
-
-queue uses `queue:*` redis keys, mesh uses `mesh:*`. they share the same
-redis instance and DB without conflicts.
-
-common pattern: include a connectionId in the task payload, then use
-mesh.sendTo() on completion to deliver results to the specific client:
-
-```js
-await queue.push({ connectionId, action: 'generate' }, { group: tenantId })
-
-queue.on('complete', ({ task, result }) => {
-  mesh.sendTo(task.payload.connectionId, 'job:complete', result)
-})
-
-queue.on('failed', ({ task, error }) => {
-  mesh.sendTo(task.payload.connectionId, 'job:failed', { error: error.message })
-})
-```
-
-if you want to notify everyone in a room instead of a single connection:
-
-```js
-await queue.push({ roomKey: 'project:abc', action: 'rebuild' })
-
-queue.on('complete', ({ task, result }) => {
-  mesh.broadcastRoom(task.payload.roomKey, 'build:complete', result)
-})
-```
-
-queue events are local-only - if you have multiple server instances, only
-the instance that processed the task can call sendTo/broadcastRoom. this
-works because mesh.sendTo and mesh.broadcastRoom route cross-instance via
-redis pub/sub internally.
-
--- cleanup --
-
-always call queue.close() on shutdown. it stops workers, clears timers,
-disconnects from redis.
-
--- delay format --
-
-delay and timeout accept strings: '100ms', '5s', '1m', etc. or plain
-numbers as milliseconds.
+events (complete, failed, retry, drain) are local to the instance that
+processed the task. in a multi-instance deployment, only the server that
+ran the task emits the event. if you need cross-instance notification,
+use redis pub/sub or @prsm/realtime broadcasting from within the event
+handler.
