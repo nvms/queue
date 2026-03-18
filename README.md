@@ -178,15 +178,15 @@ Each tenant gets up to 2 concurrent LLM calls with a 50ms pause between them. To
 
 ## WebSocket Integration with [mesh](https://github.com/nvms/mesh)
 
-Queue events are local-only - only the server that processes a task emits `complete`/`failed`. Use [mesh](https://github.com/nvms/mesh) to push results to connected clients in real time.
+Queue events are local-only - only the server that processes a task emits `complete`/`failed`. Use [@prsm/realtime](https://github.com/nvms/realtime) to push results to connected clients in real time.
 
 Send results to a specific client:
 
 ```js
 import Queue from '@prsm/queue'
-import { MeshServer } from '@mesh-kit/server'
+import { RealtimeServer } from '@prsm/realtime'
 
-const mesh = new MeshServer({ redis: { host: 'localhost', port: 6379 } })
+const realtime = new RealtimeServer({ redis: { host: 'localhost', port: 6379 } })
 const queue = new Queue({ concurrency: 5, groups: { concurrency: 1 } })
 
 queue.process(async (payload) => {
@@ -194,14 +194,14 @@ queue.process(async (payload) => {
 })
 
 queue.on('complete', ({ task, result }) => {
-  mesh.sendTo(task.payload.connectionId, 'job:complete', result)
+  realtime.sendTo(task.payload.connectionId, 'job:complete', result)
 })
 
 queue.on('failed', ({ task, error }) => {
-  mesh.sendTo(task.payload.connectionId, 'job:failed', { error: error.message })
+  realtime.sendTo(task.payload.connectionId, 'job:failed', { error: error.message })
 })
 
-mesh.exposeCommand('generate-report', async (ctx) => {
+realtime.exposeCommand('generate-report', async (ctx) => {
   const taskId = await queue.push({
     connectionId: ctx.connection.id,
     ...ctx.payload,
@@ -210,10 +210,10 @@ mesh.exposeCommand('generate-report', async (ctx) => {
 })
 
 await queue.ready()
-await mesh.listen(8080)
+await realtime.listen(8080)
 ```
 
-Both queue and mesh use the same Redis instance. No key conflicts (`queue:*` vs `mesh:*`).
+Both queue and realtime use the same Redis instance. No key conflicts (`queue:*` vs `mesh:*`).
 
 ## Horizontal Scaling
 
