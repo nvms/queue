@@ -2,6 +2,7 @@ import { createClient } from "redis"
 import { EventEmitter } from "events"
 import { randomUUID } from "crypto"
 import ms from "@prsm/ms"
+import { semaphore as createSemaphore } from "@prsm/lock"
 
 /**
  * @typedef {Object} QueueOptions
@@ -30,36 +31,6 @@ import ms from "@prsm/ms"
  * @param {Task} task
  * @returns {Promise<any>|any}
  */
-
-const ACQUIRE_SCRIPT = `
-local key = KEYS[1]
-local max = tonumber(ARGV[1])
-local id = ARGV[2]
-local ttl = tonumber(ARGV[3])
-local time = redis.call('TIME')
-local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
-redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
-if redis.call('ZCARD', key) < max then
-  redis.call('ZADD', key, now, id)
-  return 1
-end
-return 0
-`
-
-const RELEASE_SCRIPT = `
-redis.call('ZREM', KEYS[1], ARGV[1])
-return 1
-`
-
-const RENEW_SCRIPT = `
-local time = redis.call('TIME')
-local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
-if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
-  redis.call('ZADD', KEYS[1], now, ARGV[1])
-  return 1
-end
-return 0
-`
 
 const LEASE_TTL = 60000
 const HEARTBEAT_INTERVAL = 15000
@@ -131,6 +102,14 @@ export default class Queue extends EventEmitter {
 
     this._redis = createClient(this._options.redisOptions)
     this._redis.on("error", () => {})
+    this._semaphore = this._options.globalConcurrency > 0
+      ? createSemaphore({
+          max: this._options.globalConcurrency,
+          ttl: LEASE_TTL,
+          redis: this._options.redisOptions,
+          prefix: "",
+        })
+      : null
     this._subClient = null
     this._groupNotifyClient = null
     this._readyPromise = this._initialize()
@@ -326,10 +305,12 @@ export default class Queue extends EventEmitter {
     if (this._subClient?.isOpen) await this._subClient.disconnect().catch(() => {})
     this._subClient = null
     if (this._redis.isOpen) await this._redis.quit()
+    if (this._semaphore) await this._semaphore.close().catch(() => {})
   }
 
   async _initialize() {
     await this._redis.connect()
+    if (this._semaphore) await this._semaphore.peek("queue:active").catch(() => {})
     await this._startWorkers()
     if (this._options.concurrency > 0) {
       await this._subscribeToGroupNotifications()
@@ -463,14 +444,11 @@ export default class Queue extends EventEmitter {
   }
 
   async _acquireGlobal(workerId, activeMap) {
-    const leaseId = randomUUID()
     while (activeMap.get(workerId) && !this._closed) {
       if (!this._redis.isOpen) return null
-      const acquired = await this._redis.eval(ACQUIRE_SCRIPT, {
-        keys: ["queue:active"],
-        arguments: [String(this._options.globalConcurrency), leaseId, String(LEASE_TTL)],
-      })
-      if (acquired) {
+      const result = await this._semaphore.acquire("queue:active")
+      if (result.acquired) {
+        const leaseId = result.id
         this._activeLeases.add(leaseId)
         const heartbeat = setInterval(() => this._renewGlobal(leaseId).catch(() => {}), HEARTBEAT_INTERVAL)
         heartbeat.unref()
@@ -489,21 +467,11 @@ export default class Queue extends EventEmitter {
       clearInterval(heartbeat)
       this._heartbeats.delete(leaseId)
     }
-    if (this._redis.isOpen) {
-      await this._redis.eval(RELEASE_SCRIPT, {
-        keys: ["queue:active"],
-        arguments: [leaseId],
-      })
-    }
+    await this._semaphore.release("queue:active", leaseId).catch(() => {})
   }
 
   async _renewGlobal(leaseId) {
-    if (this._redis.isOpen) {
-      await this._redis.eval(RENEW_SCRIPT, {
-        keys: ["queue:active"],
-        arguments: [leaseId],
-      })
-    }
+    await this._semaphore.renew("queue:active", leaseId).catch(() => {})
   }
 
   async _processTask(task, opts) {

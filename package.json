@@ -32,6 +32,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@prsm/lock": "file:../lock",
     "@prsm/ms": "^1.0.1",
     "redis": "^5.1.1"
   },
