@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "declaration": true,
+    "allowJs": true,
+    "emitDeclarationOnly": true,
+    "skipLibCheck": true,
+    "target": "es2020",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": false,
+    "esModuleInterop": true,
+    "outDir": "./types"
+  },
+  "include": ["src/index.js"],
+  "exclude": ["node_modules"]
+}

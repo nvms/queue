@@ -1,6 +1,6 @@
 {
   "name": "@prsm/queue",
-  "version": "3.0.5",
+  "version": "3.0.6",
   "description": "Redis-backed distributed task queue with grouped concurrency, retries, and rate limiting",
   "type": "module",
   "exports": {
@@ -17,7 +17,7 @@
   "scripts": {
     "test": "vitest --reporter=verbose --run",
     "test:watch": "vitest",
-    "prepublishOnly": "npx tsc --declaration --allowJs --emitDeclarationOnly --skipLibCheck --target es2020 --module nodenext --moduleResolution nodenext --strict false --esModuleInterop true --outDir ./types src/index.js"
+    "prepublishOnly": "npx tsc -p tsconfig.json"
   },
   "keywords": [
     "queue",
