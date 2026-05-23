@@ -86,6 +86,7 @@ export default class Queue extends EventEmitter {
       cleanupInterval: options.cleanupInterval ?? 30000,
     }
 
+    this._tracer = options.tracer ?? null
     this._handler = null
     this._workers = new Map()
     this._groupWorkers = new Map()
@@ -137,15 +138,21 @@ export default class Queue extends EventEmitter {
    */
   async push(payload, { group } = {}) {
     if (this._closed) throw new Error("Queue is closed")
+    const traceparent = this._tracer ? this._tracer.toTraceparent() : null
     const task = group
       ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+    if (traceparent) task.traceparent = traceparent
     this._pushed++
+    const span = this._tracer?.startSpan('queue.push', { 'queue.group': group ?? null, 'task.uuid': task.uuid }, { kind: 'producer' })
     try {
       await this._enqueue(task, group)
     } catch (err) {
       this._pushed--
+      span?.setError(err)
       throw err
+    } finally {
+      span?.end()
     }
     this.emit("new", { task })
     return task.uuid
@@ -158,9 +165,11 @@ export default class Queue extends EventEmitter {
    */
   async pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) throw new Error("Queue is closed")
+    const traceparent = this._tracer ? this._tracer.toTraceparent() : null
     const task = group
       ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+    if (traceparent) task.traceparent = traceparent
     this._pushed++
     const { promise, ready } = this._awaitTask(task.uuid, timeout)
     promise.catch(() => {})
@@ -482,17 +491,35 @@ export default class Queue extends EventEmitter {
     let succeeded = false
 
     if (this._handler) {
-      try {
+      const parent = this._tracer && task.traceparent ? this._tracer.fromTraceparent(task.traceparent) : null
+      const handle = this._tracer?.startSpan('queue.process', {
+        'queue.group': task.group ?? null,
+        'task.uuid': task.uuid,
+        'task.attempt': task.attempts,
+      }, {
+        kind: 'consumer',
+        parent: parent ? { traceId: parent.traceId, spanId: parent.parentSpanId, sampled: parent.sampled } : null,
+      })
+      const runHandler = async () => {
         const timeoutPromise = opts.timeout > 0
           ? new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Task timeout")), opts.timeout) })
           : null
         const workPromise = Promise.resolve(this._handler(task.payload, task))
         result = timeoutPromise ? await Promise.race([workPromise, timeoutPromise]) : await workPromise
         succeeded = true
+      }
+      try {
+        if (handle) {
+          await this._tracer.run(handle.context, runHandler)
+        } else {
+          await runHandler()
+        }
       } catch (err) {
         handlerError = err
+        handle?.setError(err)
       } finally {
         if (timer) clearTimeout(timer)
+        handle?.end()
       }
     } else {
       succeeded = true
