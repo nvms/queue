@@ -138,13 +138,12 @@ export default class Queue extends EventEmitter {
    */
   async push(payload, { group } = {}) {
     if (this._closed) throw new Error("Queue is closed")
-    const traceparent = this._tracer ? this._tracer.toTraceparent() : null
     const task = group
       ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
-    if (traceparent) task.traceparent = traceparent
     this._pushed++
     const span = this._tracer?.startSpan('queue.push', { 'queue.group': group ?? null, 'task.uuid': task.uuid }, { kind: 'producer' })
+    if (span) task.traceparent = this._tracer.toTraceparent(span.context)
     try {
       await this._enqueue(task, group)
     } catch (err) {
@@ -165,11 +164,14 @@ export default class Queue extends EventEmitter {
    */
   async pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) throw new Error("Queue is closed")
-    const traceparent = this._tracer ? this._tracer.toTraceparent() : null
     const task = group
       ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
-    if (traceparent) task.traceparent = traceparent
+    const tpSpan = this._tracer?.startSpan('queue.pushAndWait', { 'queue.group': group ?? null, 'task.uuid': task.uuid }, { kind: 'producer' })
+    if (tpSpan) {
+      task.traceparent = this._tracer.toTraceparent(tpSpan.context)
+      tpSpan.end()
+    }
     this._pushed++
     const { promise, ready } = this._awaitTask(task.uuid, timeout)
     promise.catch(() => {})
