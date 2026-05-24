@@ -98,6 +98,7 @@ export default class Queue extends EventEmitter {
     this._pushed = 0
     this._totalSettled = 0
     this._inFlightTasks = new Map()
+    this._instanceId = randomUUID()
     this._closed = false
     this._localSemaphore = new LocalSemaphore(this._options.concurrency)
     this._activeLeases = new Set()
@@ -173,15 +174,48 @@ export default class Queue extends EventEmitter {
     })).sort((a, b) => a.name.localeCompare(b.name))
 
     const inFlightTasks = []
+    const seen = new Set()
     for (const [uuid, entry] of this._inFlightTasks) {
+      seen.add(uuid)
       inFlightTasks.push({
         uuid,
         group: entry.group,
         attempts: entry.task.attempts,
         startedAt: entry.startedAt,
         workerId: entry.workerId,
+        instanceId: this._instanceId,
+        local: true,
         payload: includePayload ? entry.task.payload : undefined,
       })
+    }
+    if (this._redis?.isOpen) {
+      try {
+        const keys = []
+        for await (const batch of this._redis.scanIterator({ MATCH: 'queue:inflight:*', COUNT: 100 })) {
+          if (Array.isArray(batch)) keys.push(...batch)
+          else keys.push(batch)
+        }
+        if (keys.length) {
+          const values = await this._redis.mGet(keys)
+          for (const raw of values) {
+            if (!raw) continue
+            try {
+              const entry = JSON.parse(raw)
+              if (seen.has(entry.uuid)) continue
+              inFlightTasks.push({
+                uuid: entry.uuid,
+                group: entry.group ?? null,
+                attempts: entry.attempts,
+                startedAt: entry.startedAt,
+                workerId: entry.workerId,
+                instanceId: entry.instanceId,
+                local: entry.instanceId === this._instanceId,
+                payload: includePayload ? entry.payload : undefined,
+              })
+            } catch {}
+          }
+        }
+      } catch {}
     }
     inFlightTasks.sort((a, b) => a.startedAt - b.startedAt)
 
@@ -197,6 +231,7 @@ export default class Queue extends EventEmitter {
         maxRetries: opts.maxRetries,
         groups: { ...opts.groups },
       },
+      instanceId: this._instanceId,
       inFlight: this._inFlight,
       defaultInFlight: this._defaultInFlight,
       pushed: this._pushed,
@@ -516,11 +551,13 @@ export default class Queue extends EventEmitter {
             this._defaultInFlight++
           }
           this._inFlightTasks.set(task.uuid, { task, startedAt: Date.now(), workerId, group: opts.group ?? null })
+          this._writeInflightRemote(task, workerId, opts.group).catch(() => {})
 
           try {
             await this._processTask(task, opts)
           } finally {
             this._inFlightTasks.delete(task.uuid)
+            this._clearInflightRemote(task.uuid).catch(() => {})
             if (opts.group) {
               const count = (this._groupInFlight.get(opts.group) || 1) - 1
               if (count <= 0) this._groupInFlight.delete(opts.group)
@@ -638,6 +675,33 @@ export default class Queue extends EventEmitter {
       this._publishResult(task.uuid, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
       try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
     }
+  }
+
+  async _writeInflightRemote(task, workerId, group) {
+    if (!this._redis?.isOpen) return
+    const timeoutMs = group ? this._options.groups.timeout : this._options.timeout
+    const ttlMs = Math.max(60_000, (timeoutMs || 0) * 2)
+    try {
+      await this._redis.set(
+        `queue:inflight:${task.uuid}`,
+        JSON.stringify({
+          uuid: task.uuid,
+          payload: task.payload,
+          group: task.group ?? null,
+          attempts: task.attempts,
+          createdAt: task.createdAt,
+          startedAt: Date.now(),
+          workerId,
+          instanceId: this._instanceId,
+        }),
+        { PX: ttlMs }
+      )
+    } catch {}
+  }
+
+  async _clearInflightRemote(uuid) {
+    if (!this._redis?.isOpen) return
+    try { await this._redis.del(`queue:inflight:${uuid}`) } catch {}
   }
 
   _publishResult(uuid, payload) {
