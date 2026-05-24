@@ -94,8 +94,10 @@ export default class Queue extends EventEmitter {
     this._workerClients = []
     this._cleanupTimer = null
     this._inFlight = 0
+    this._defaultInFlight = 0
     this._pushed = 0
     this._totalSettled = 0
+    this._inFlightTasks = new Map()
     this._closed = false
     this._localSemaphore = new LocalSemaphore(this._options.concurrency)
     this._activeLeases = new Set()
@@ -124,6 +126,86 @@ export default class Queue extends EventEmitter {
   /** @returns {number} */
   get inFlight() {
     return this._inFlight
+  }
+
+  /**
+   * Point-in-time snapshot of this instance's state and Redis-backed depth counts.
+   * Safe to call from observability/devtools - hits Redis with LLEN per known group.
+   * @returns {Promise<{
+   *   options: object,
+   *   inFlight: number,
+   *   defaultInFlight: number,
+   *   pushed: number,
+   *   settled: number,
+   *   defaultDepth: number,
+   *   workers: { default: number, group: number },
+   *   groups: Array<{ name: string, inFlight: number, depth: number, workers: number }>,
+   *   inFlightTasks: Array<{ uuid: string, group: string|null, attempts: number, startedAt: number, workerId: string, payload: any }>,
+   * }>}
+   */
+  async snapshot({ includePayload = false } = {}) {
+    const opts = this._options
+    const groupNames = new Set([
+      ...this._groupWorkers.keys(),
+      ...this._groupInFlight.keys(),
+    ])
+
+    let defaultDepth = 0
+    const groupDepths = new Map()
+    if (this._redis?.isOpen) {
+      try {
+        defaultDepth = await this._redis.lLen('queue:tasks')
+      } catch {}
+      for (const name of groupNames) {
+        try {
+          groupDepths.set(name, await this._redis.lLen(`queue:groups:${name}`))
+        } catch {
+          groupDepths.set(name, 0)
+        }
+      }
+    }
+
+    const groups = Array.from(groupNames).map((name) => ({
+      name,
+      inFlight: this._groupInFlight.get(name) || 0,
+      depth: groupDepths.get(name) || 0,
+      workers: this._groupWorkers.get(name)?.size || 0,
+    })).sort((a, b) => a.name.localeCompare(b.name))
+
+    const inFlightTasks = []
+    for (const [uuid, entry] of this._inFlightTasks) {
+      inFlightTasks.push({
+        uuid,
+        group: entry.group,
+        attempts: entry.task.attempts,
+        startedAt: entry.startedAt,
+        workerId: entry.workerId,
+        payload: includePayload ? entry.task.payload : undefined,
+      })
+    }
+    inFlightTasks.sort((a, b) => a.startedAt - b.startedAt)
+
+    let groupWorkerTotal = 0
+    for (const m of this._groupWorkers.values()) groupWorkerTotal += m.size
+
+    return {
+      options: {
+        concurrency: opts.concurrency,
+        globalConcurrency: opts.globalConcurrency,
+        delay: opts.delay,
+        timeout: opts.timeout,
+        maxRetries: opts.maxRetries,
+        groups: { ...opts.groups },
+      },
+      inFlight: this._inFlight,
+      defaultInFlight: this._defaultInFlight,
+      pushed: this._pushed,
+      settled: this._totalSettled,
+      defaultDepth,
+      workers: { default: this._workers.size, group: groupWorkerTotal },
+      groups,
+      inFlightTasks,
+    }
   }
 
   /** @param {TaskHandler} handler */
@@ -430,15 +512,21 @@ export default class Queue extends EventEmitter {
           this._inFlight++
           if (opts.group) {
             this._groupInFlight.set(opts.group, (this._groupInFlight.get(opts.group) || 0) + 1)
+          } else {
+            this._defaultInFlight++
           }
+          this._inFlightTasks.set(task.uuid, { task, startedAt: Date.now(), workerId, group: opts.group ?? null })
 
           try {
             await this._processTask(task, opts)
           } finally {
+            this._inFlightTasks.delete(task.uuid)
             if (opts.group) {
               const count = (this._groupInFlight.get(opts.group) || 1) - 1
               if (count <= 0) this._groupInFlight.delete(opts.group)
               else this._groupInFlight.set(opts.group, count)
+            } else {
+              this._defaultInFlight = Math.max(0, this._defaultInFlight - 1)
             }
             if (leaseId) await this._releaseGlobal(leaseId).catch(() => {})
           }
