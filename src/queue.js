@@ -14,6 +14,7 @@ import { semaphore as createSemaphore } from "@prsm/lock"
  * @property {{concurrency?: number, delay?: number|string, timeout?: number|string, maxRetries?: number}} [groups] - overrides for grouped queues
  * @property {{url?: string, host?: string, port?: number, password?: string}} [redisOptions]
  * @property {number} [cleanupInterval] - ms between empty group cleanup (default 30000, 0 to disable)
+ * @property {number|string} [connectTimeout] - max time to wait for a Redis connection before ready() rejects, ms or string like "10s" (default "10s", 0 to wait forever)
  */
 
 /**
@@ -23,18 +24,22 @@ import { semaphore as createSemaphore } from "@prsm/lock"
  * @property {number} createdAt
  * @property {string} [group]
  * @property {number} attempts
+ * @property {AbortSignal} [signal] - aborts when the per-task timeout fires
  */
 
 /**
  * @callback TaskHandler
  * @param {any} payload
  * @param {Task} task
+ * @param {AbortSignal} signal - aborts when the per-task timeout fires; also available as task.signal
  * @returns {Promise<any>|any}
  */
 
 const LEASE_TTL = 60000
 const HEARTBEAT_INTERVAL = 15000
 const CLOSE_TIMEOUT = 5000
+const RESULT_TTL = 60000
+const RESULT_POLL_INTERVAL = 1000
 
 class LocalSemaphore {
   constructor(max) {
@@ -84,6 +89,7 @@ export default class Queue extends EventEmitter {
       },
       redisOptions: options.redisOptions ?? {},
       cleanupInterval: options.cleanupInterval ?? 30000,
+      connectTimeout: ms(options.connectTimeout ?? "10s"),
     }
 
     this._tracer = options.tracer ?? null
@@ -117,6 +123,9 @@ export default class Queue extends EventEmitter {
     this._subClient = null
     this._groupNotifyClient = null
     this._readyPromise = this._initialize()
+    // ready() callers see this rejection; the no-op keeps an unawaited queue
+    // from emitting an unhandledRejection when the initial connect fails
+    this._readyPromise.catch(() => {})
   }
 
   /** @returns {Promise<void>} */
@@ -282,8 +291,8 @@ export default class Queue extends EventEmitter {
   async pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) throw new Error("Queue is closed")
     const task = group
-      ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
-      : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+      ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0, awaitResult: true }
+      : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0, awaitResult: true }
     const tpSpan = this._tracer?.startSpan('queue.pushAndWait', { 'queue.group': group ?? null, 'task.uuid': task.uuid }, { kind: 'producer' })
     if (tpSpan) {
       task.traceparent = this._tracer.toTraceparent(tpSpan.context)
@@ -331,8 +340,35 @@ export default class Queue extends EventEmitter {
     if (this._subClient) return this._subClient
     this._subClient = this._redis.duplicate()
     this._subClient.on("error", () => {})
-    await this._subClient.connect()
+    await this._connectWithDeadline(this._subClient, "sub")
     return this._subClient
+  }
+
+  // node-redis keeps retrying a refused connection forever, so connect() never
+  // settles when redis is down at startup. bound it so ready() rejects instead
+  // of hanging, while leaving the default infinite reconnect for an already
+  // connected client (survives transient outages and failovers)
+  /** @private */
+  async _connectWithDeadline(client, label) {
+    const deadline = this._options.connectTimeout
+    if (!deadline || deadline <= 0) return client.connect()
+    const connectP = client.connect()
+    connectP.catch(() => {})
+    let timer
+    try {
+      await Promise.race([
+        connectP,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Redis connection timed out after ${deadline}ms (${label})`)), deadline)
+          timer.unref?.()
+        }),
+      ])
+    } catch (err) {
+      try { if (client.isOpen) await client.disconnect() } catch {}
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** @private */
@@ -345,6 +381,7 @@ export default class Queue extends EventEmitter {
 
     const promise = new Promise((resolve, reject) => {
       let timer
+      let pollTimer
       let settled = false
 
       const settle = (fn, value) => {
@@ -352,6 +389,11 @@ export default class Queue extends EventEmitter {
         settled = true
         cleanup()
         fn(value)
+      }
+
+      const settleFromPayload = ({ status, result, error }) => {
+        if (status === "complete") settle(resolve, result)
+        else settle(reject, error ? Object.assign(new Error(error.message), error) : new Error("Task failed"))
       }
 
       const onLocal = (event) => ({ task, result, error }) => {
@@ -363,17 +405,33 @@ export default class Queue extends EventEmitter {
       const onComplete = onLocal("complete")
       const onFailed = onLocal("failed")
 
+      // safety net for a dropped pub/sub message: read the durable result key
+      const consumeDurable = async () => {
+        if (settled || !this._redis?.isOpen) return
+        let raw
+        try { raw = await this._redis.get(channel) } catch { return }
+        if (!raw || settled) return
+        try { settleFromPayload(JSON.parse(raw)) } catch {}
+      }
+
       const cleanup = () => {
         if (timer) clearTimeout(timer)
+        if (pollTimer) clearInterval(pollTimer)
         this.off("complete", onComplete)
         this.off("failed", onFailed)
         this._subClient?.unsubscribe(channel).catch(() => {})
+        this._redis?.del(channel).catch(() => {})
       }
 
       if (ms_ > 0) {
-        timer = setTimeout(() => settle(reject, new Error("pushAndWait timed out")), ms_)
+        timer = setTimeout(() => {
+          consumeDurable().finally(() => settle(reject, new Error("pushAndWait timed out")))
+        }, ms_)
         timer.unref?.()
       }
+
+      pollTimer = setInterval(() => { consumeDurable() }, RESULT_POLL_INTERVAL)
+      pollTimer.unref?.()
 
       this.on("complete", onComplete)
       this.on("failed", onFailed)
@@ -381,11 +439,7 @@ export default class Queue extends EventEmitter {
       this._ensureSubClient().then((sub) => {
         if (settled) { resolveReady(); return }
         sub.subscribe(channel, (message) => {
-          try {
-            const { status, result, error } = JSON.parse(message)
-            if (status === "complete") settle(resolve, result)
-            else settle(reject, error ? Object.assign(new Error(error.message), error) : new Error("Task failed"))
-          } catch {}
+          try { settleFromPayload(JSON.parse(message)) } catch {}
         }).then(() => resolveReady()).catch(() => resolveReady())
       }).catch(() => resolveReady())
     })
@@ -441,7 +495,7 @@ export default class Queue extends EventEmitter {
   }
 
   async _initialize() {
-    await this._redis.connect()
+    await this._connectWithDeadline(this._redis, "main")
     if (this._semaphore) await this._semaphore.peek("queue:active").catch(() => {})
     await this._startWorkers()
     if (this._options.concurrency > 0) {
@@ -457,7 +511,7 @@ export default class Queue extends EventEmitter {
   async _subscribeToGroupNotifications() {
     this._groupNotifyClient = this._redis.duplicate()
     this._groupNotifyClient.on("error", () => {})
-    await this._groupNotifyClient.connect()
+    await this._connectWithDeadline(this._groupNotifyClient, "notify")
     await this._groupNotifyClient.subscribe("queue:group:notify", (group) => {
       this._ensureGroupWorkers(group)
     })
@@ -474,7 +528,7 @@ export default class Queue extends EventEmitter {
   async _createWorkerClient() {
     const client = this._redis.duplicate()
     client.on("error", () => {})
-    await client.connect()
+    await this._connectWithDeadline(client, "worker")
     this._workerClients.push(client)
     return client
   }
@@ -644,11 +698,21 @@ export default class Queue extends EventEmitter {
         kind: 'consumer',
         parent: parent ? { traceId: parent.traceId, spanId: parent.parentSpanId, sampled: parent.sampled } : null,
       })
+      const controller = new AbortController()
+      // exposed as task.signal too, non-enumerable so it never gets serialized
+      // onto the task when it is re-queued for a retry
+      Object.defineProperty(task, "signal", { value: controller.signal, configurable: true, enumerable: false })
       const runHandler = async () => {
         const timeoutPromise = opts.timeout > 0
-          ? new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Task timeout")), opts.timeout) })
+          ? new Promise((_, reject) => {
+              timer = setTimeout(() => {
+                const err = new Error("Task timeout")
+                controller.abort(err)
+                reject(err)
+              }, opts.timeout)
+            })
           : null
-        const workPromise = Promise.resolve(this._handler(task.payload, task))
+        const workPromise = Promise.resolve(this._handler(task.payload, task, controller.signal))
         result = timeoutPromise ? await Promise.race([workPromise, timeoutPromise]) : await workPromise
         succeeded = true
       }
@@ -671,7 +735,7 @@ export default class Queue extends EventEmitter {
 
     if (succeeded) {
       this._settle()
-      this._publishResult(task.uuid, { status: "complete", result })
+      this._publishResult(task, { status: "complete", result })
       try { this.emit("complete", { task, result }) } finally { this._emitDrain() }
     } else if (task.attempts < opts.maxRetries && !this._closed) {
       let retried = false
@@ -684,12 +748,12 @@ export default class Queue extends EventEmitter {
         this.emit("retry", { task, error: handlerError, attempt: task.attempts })
       } else {
         this._settle()
-        this._publishResult(task.uuid, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
+        this._publishResult(task, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
         try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
       }
     } else {
       this._settle()
-      this._publishResult(task.uuid, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
+      this._publishResult(task, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
       try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
     }
   }
@@ -721,10 +785,15 @@ export default class Queue extends EventEmitter {
     try { await this._redis.del(`queue:inflight:${uuid}`) } catch {}
   }
 
-  _publishResult(uuid, payload) {
+  // pub/sub is at-most-once: a waiter on another instance loses the result if
+  // the message drops. for waited-on tasks we also persist it to a short-lived
+  // key the waiter can read, making delivery at-least-once
+  _publishResult(task, payload) {
     if (!this._redis.isOpen) return
-    const channel = `queue:result:${uuid}`
-    this._redis.publish(channel, JSON.stringify(payload)).catch(() => {})
+    const key = `queue:result:${task.uuid}`
+    const data = JSON.stringify(payload)
+    this._redis.publish(key, data).catch(() => {})
+    if (task.awaitResult) this._redis.set(key, data, { PX: RESULT_TTL }).catch(() => {})
   }
 
   _settle() {

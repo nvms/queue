@@ -47,6 +47,7 @@ const queue = new Queue({
   delay: '100ms',           // pause between tasks (string or ms)
   timeout: '30s',           // max task duration
   maxRetries: 3,            // attempts before failing
+  connectTimeout: '10s',    // max wait for the initial Redis connection (string or ms)
 
   groups: {
     concurrency: 1,         // max concurrent tasks per group
@@ -108,6 +109,15 @@ queue.process(async (payload, task) => {
 
 Throw an error to trigger retry. After `maxRetries`, the task fails permanently.
 
+The handler receives an `AbortSignal` as its third argument (also available as `task.signal`) that aborts when the per-task `timeout` fires. Pass it to anything that supports cancellation so the work stops instead of running detached while a retry begins.
+
+```js
+queue.process(async (payload, task, signal) => {
+  const res = await fetch(payload.url, { signal })
+  return await res.json()
+})
+```
+
 ## Grouped Queues
 
 Isolated concurrency per key - perfect for per-tenant throttling. Pass `{ group }` as the second argument to `push` or `pushAndWait`.
@@ -151,6 +161,8 @@ const result = await queue.pushAndWait(
 
 Throws if the task fails (after retries are exhausted) or if the timeout is reached. Retries are transparent - if the handler fails twice then succeeds on the third attempt, `pushAndWait` resolves with the successful result.
 
+Cross-instance delivery is at-least-once. The result is sent over Redis pub/sub for low latency and also written to a short-lived key the waiter reads as a fallback, so a dropped pub/sub message does not turn a completed task into a spurious timeout.
+
 ## Events
 
 ```js
@@ -169,7 +181,8 @@ queue.on('drain', () => {})
   payload: any,
   createdAt: number,
   group?: string,     // present when pushed with { group }
-  attempts: number
+  attempts: number,
+  signal?: AbortSignal // aborts when the per-task timeout fires
 }
 ```
 
@@ -276,6 +289,14 @@ Both queue and realtime use the same Redis instance. No key conflicts (`queue:*`
 ## Horizontal Scaling
 
 Multiple servers can push to the same queue. Redis coordinates via atomic operations - no duplicate processing. Use `globalConcurrency` to enforce a hard limit across all instances.
+
+## Startup
+
+```js
+await queue.ready()
+```
+
+`ready()` resolves once connected. If Redis is unreachable, it rejects after `connectTimeout` (default 10 seconds) instead of hanging, so a process that gates startup on `await queue.ready()` gets a real error to handle. Set `connectTimeout: 0` to wait indefinitely. Once connected, the client follows Redis's default reconnect behavior and rides out transient outages.
 
 ## Cleanup
 

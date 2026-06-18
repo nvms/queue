@@ -275,6 +275,49 @@ describe("Queue", () => {
     })
   })
 
+  describe("task timeout signal", () => {
+    it("aborts the handler signal when the task times out", async () => {
+      queue = new Queue({ concurrency: 1, timeout: 50, maxRetries: 1 })
+
+      let sawSignal = false
+      let abortReason
+      queue.process(async (payload, task, signal) => {
+        sawSignal = signal instanceof AbortSignal && signal === task.signal
+        await new Promise((resolve) => {
+          signal.addEventListener("abort", () => { abortReason = signal.reason; resolve() }, { once: true })
+        })
+        return "finished-after-abort"
+      })
+
+      const failedPromise = waitForEvent(queue, "failed")
+      await queue.ready()
+      await queue.push({ id: 1 })
+      const { error } = await failedPromise
+
+      expect(sawSignal).toBe(true)
+      expect(error.message).toBe("Task timeout")
+      expect(abortReason?.message).toBe("Task timeout")
+    })
+
+    it("does not abort the signal when the handler finishes in time", async () => {
+      queue = new Queue({ concurrency: 1, timeout: 1000 })
+
+      let abortedDuringRun = true
+      queue.process(async (payload, task, signal) => {
+        await new Promise((r) => setTimeout(r, 20))
+        abortedDuringRun = signal.aborted
+        return "ok"
+      })
+
+      const done = waitForEvent(queue, "complete")
+      await queue.ready()
+      await queue.push({ id: 1 })
+      await done
+
+      expect(abortedDuringRun).toBe(false)
+    })
+  })
+
   describe("concurrency", () => {
     it("should process tasks in parallel up to concurrency limit", async () => {
       queue = new Queue({ concurrency: 2 })
@@ -1047,6 +1090,69 @@ describe("Queue", () => {
     })
   })
 
+  describe("pushAndWait durability", () => {
+    it("recovers the result via the durable key when the pub/sub message is lost", async () => {
+      queue = new Queue({ concurrency: 0, cleanupInterval: 0 })
+      await queue.ready()
+
+      // simulate total pub/sub loss on the waiter: subscribe registers no handler
+      const sub = await queue._ensureSubClient()
+      const realSubscribe = sub.subscribe.bind(sub)
+      sub.subscribe = (channel) => realSubscribe(channel, () => {})
+
+      const worker = new Queue({ concurrency: 1 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => ({ echo: payload.message }))
+      await worker.ready()
+
+      const result = await queue.pushAndWait({ message: "durable" }, { timeout: 5000 })
+      expect(result).toEqual({ echo: "durable" })
+    })
+
+    it("recovers a failure via the durable key when the pub/sub message is lost", async () => {
+      queue = new Queue({ concurrency: 0, cleanupInterval: 0 })
+      await queue.ready()
+
+      const sub = await queue._ensureSubClient()
+      const realSubscribe = sub.subscribe.bind(sub)
+      sub.subscribe = (channel) => realSubscribe(channel, () => {})
+
+      const worker = new Queue({ concurrency: 1, maxRetries: 1 })
+      extraQueues.push(worker)
+      worker.process(async () => { throw new Error("remote boom") })
+      await worker.ready()
+
+      await expect(queue.pushAndWait({ id: 1 }, { timeout: 5000 })).rejects.toThrow("remote boom")
+    })
+
+    it("does not persist a durable result key for fire-and-forget push", async () => {
+      queue = new Queue({ concurrency: 1, cleanupInterval: 0 })
+      queue.process(async () => "ok")
+      await queue.ready()
+
+      const uuid = await new Promise((res) => {
+        queue.once("complete", ({ task }) => res(task.uuid))
+        queue.push({ id: 1 })
+      })
+
+      expect(await redis.exists(`queue:result:${uuid}`)).toBe(0)
+    })
+
+    it("cleans up the durable key after a waited task resolves", async () => {
+      queue = new Queue({ concurrency: 1, cleanupInterval: 0 })
+      queue.process(async (payload) => payload.id)
+      await queue.ready()
+
+      let uuid
+      queue.once("new", ({ task }) => { uuid = task.uuid })
+      const result = await queue.pushAndWait({ id: "z" })
+      expect(result).toBe("z")
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(await redis.exists(`queue:result:${uuid}`)).toBe(0)
+    })
+  })
+
   describe("cross-instance group discovery", () => {
     it("should process grouped tasks pushed by another instance", async () => {
       const worker = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
@@ -1259,6 +1365,34 @@ describe("Queue", () => {
 
       await expect(queue.pushAndWait({ id: 1 })).rejects.toThrow("Queue is closed")
       queue = null
+    })
+  })
+
+  describe("startup connection", () => {
+    it("should reject ready() instead of hanging when redis is unreachable", async () => {
+      const q = new Queue({
+        redisOptions: { url: "redis://127.0.0.1:6399" },
+        connectTimeout: 500,
+        cleanupInterval: 0,
+      })
+
+      const start = Date.now()
+      await expect(q.ready()).rejects.toThrow(/timed out/i)
+      expect(Date.now() - start).toBeLessThan(3000)
+
+      await q.close().catch(() => {})
+    })
+
+    it("should accept a duration string for connectTimeout", async () => {
+      const q = new Queue({
+        redisOptions: { url: "redis://127.0.0.1:6399" },
+        connectTimeout: "400ms",
+        cleanupInterval: 0,
+      })
+
+      await expect(q.ready()).rejects.toThrow(/timed out/i)
+
+      await q.close().catch(() => {})
     })
   })
 })
