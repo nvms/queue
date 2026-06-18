@@ -822,7 +822,12 @@ describe("Queue", () => {
 
     it("should emit drain after the last complete event, not before", async () => {
       queue = new Queue({ concurrency: 2 })
-      queue.process(async () => "done")
+      // gate the handler so neither task can complete until both are pushed and
+      // in-flight. otherwise task 1 can finish before push 2's redis round-trip
+      // returns, and the queue legitimately drains between the two pushes
+      let release
+      const gate = new Promise((resolve) => { release = resolve })
+      queue.process(async () => { await gate; return "done" })
       await queue.ready()
 
       const events = []
@@ -832,6 +837,7 @@ describe("Queue", () => {
       const drainPromise = waitForEvent(queue, "drain")
       await queue.push({ id: 1 })
       await queue.push({ id: 2 })
+      release()
       await drainPromise
 
       expect(events.filter((e) => e === "complete").length).toBe(2)
