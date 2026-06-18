@@ -6,32 +6,33 @@ import { semaphore as createSemaphore } from "@prsm/lock"
 
 /**
  * @typedef {Object} QueueOptions
- * @property {number} [concurrency] - max concurrent tasks per instance (default 1)
- * @property {number} [globalConcurrency] - max concurrent tasks across all instances, Redis-backed (default 0, disabled)
- * @property {number|string} [delay] - pause between tasks, ms or string like "100ms" (default 0)
- * @property {number|string} [timeout] - max task duration, ms or string like "30s" (default 0, no limit)
- * @property {number} [maxRetries] - attempts before failing (default 3)
- * @property {{concurrency?: number, delay?: number|string, timeout?: number|string, maxRetries?: number}} [groups] - overrides for grouped queues
- * @property {{url?: string, host?: string, port?: number, password?: string}} [redisOptions]
- * @property {number} [cleanupInterval] - ms between empty group cleanup (default 30000, 0 to disable)
- * @property {number|string} [connectTimeout] - max time to wait for a Redis connection before ready() rejects, ms or string like "10s" (default "10s", 0 to wait forever)
+ * @property {number} [concurrency] - maximum number of tasks this instance processes at once across both the default queue and all groups, enforced by an in-memory semaphore (default 1). This is also the number of worker loops created for the default queue. Set to 0 to make this instance push-only, enqueuing tasks without processing any.
+ * @property {number} [globalConcurrency] - maximum number of tasks running concurrently across every instance sharing the same Redis, enforced by a Redis-backed semaphore with lease expiry (default 0, which disables the global limit). If an instance crashes mid-task its slots are reclaimed after the 60 second lease expires, so set a per-task timeout shorter than that to avoid holding slots longer than needed.
+ * @property {number|string} [delay] - pause inserted after each task before the worker pulls the next one, as milliseconds or a duration string such as "100ms" (default 0, no pause). Useful as a coarse rate limit per worker.
+ * @property {number|string} [timeout] - maximum time a single task may run before it is aborted and treated as a failed attempt, as milliseconds or a duration string such as "30s" (default 0, no limit). When it fires, the AbortSignal passed to the handler is aborted so cancellation-aware work stops instead of running detached during the retry.
+ * @property {number} [maxRetries] - total number of attempts allowed before a task fails permanently, counting the first try (default 3). A handler that throws is retried until this count is reached, after which the "failed" event fires.
+ * @property {{concurrency?: number, delay?: number|string, timeout?: number|string, maxRetries?: number}} [groups] - per-group overrides applied to grouped tasks. concurrency is the limit within a single group (default 1); delay, timeout, and maxRetries fall back to the top-level values when omitted. The top-level concurrency still caps total in-flight tasks on this instance, so groups partition that budget rather than adding to it.
+ * @property {{url?: string, host?: string, port?: number, password?: string}} [redisOptions] - connection options passed to the node-redis client. Provide either a url or discrete host/port/password fields (defaults to redis on localhost:6379).
+ * @property {number} [cleanupInterval] - interval in milliseconds at which idle, empty group workers are torn down and dropped default workers are revived (default 30000, 0 to disable). The timer is unref'd so it does not keep the process alive on its own.
+ * @property {number|string} [connectTimeout] - maximum time to wait for the initial Redis connection before ready() rejects, as milliseconds or a duration string such as "10s" (default "10s", 0 to wait forever). This bounds startup: node-redis retries a refused connection indefinitely, so without a deadline ready() would hang when Redis is down. It applies only to the initial connect; once connected the client uses Redis's default reconnect behavior to ride out transient outages.
+ * @property {object} [tracer] - optional @prsm/trace tracer; when provided, push, pushAndWait, and task processing emit spans (default none).
  */
 
 /**
  * @typedef {Object} Task
- * @property {string} uuid
- * @property {any} payload
- * @property {number} createdAt
- * @property {string} [group]
- * @property {number} attempts
- * @property {AbortSignal} [signal] - aborts when the per-task timeout fires
+ * @property {string} uuid - unique identifier generated when the task is pushed, returned by push() and used to correlate results.
+ * @property {any} payload - the value passed to push(), handed to the handler as its first argument.
+ * @property {number} createdAt - epoch milliseconds at which the task was pushed.
+ * @property {string} [group] - the group key the task was pushed with, present only for grouped tasks.
+ * @property {number} attempts - number of times the handler has been invoked for this task, starting at 1 on the first run and incrementing on each retry.
+ * @property {AbortSignal} [signal] - aborts when the per-task timeout fires; pass it to cancellation-aware work so it stops instead of running detached during a retry. Non-enumerable, so it is not serialized when the task is re-queued.
  */
 
 /**
  * @callback TaskHandler
- * @param {any} payload
- * @param {Task} task
- * @param {AbortSignal} signal - aborts when the per-task timeout fires; also available as task.signal
+ * @param {any} payload - the value the task was pushed with. Throw to trigger a retry; the return value is delivered as the result.
+ * @param {Task} task - the full task object, including uuid, attempts, and group.
+ * @param {AbortSignal} signal - aborts when the per-task timeout fires; also available as task.signal. Pass it to anything that supports cancellation so the work stops instead of running detached while a retry begins.
  * @returns {Promise<any>|any}
  */
 
@@ -71,7 +72,7 @@ class LocalSemaphore {
 }
 
 export default class Queue extends EventEmitter {
-  /** @param {QueueOptions} [options] */
+  /** @param {QueueOptions} [options] - configuration for concurrency, retries, timing, and the Redis connection. */
   constructor(options = {}) {
     super()
 
@@ -128,12 +129,18 @@ export default class Queue extends EventEmitter {
     this._readyPromise.catch(() => {})
   }
 
-  /** @returns {Promise<void>} */
+  /**
+   * Resolve once the queue is connected to Redis and workers are running. Rejects if the connection cannot be established within connectTimeout.
+   * @returns {Promise<void>}
+   */
   ready() {
     return this._readyPromise
   }
 
-  /** @returns {number} */
+  /**
+   * Number of tasks this instance is processing right now, across the default queue and all groups.
+   * @returns {number}
+   */
   get inFlight() {
     return this._inFlight
   }
@@ -152,6 +159,7 @@ export default class Queue extends EventEmitter {
    *   groups: Array<{ name: string, inFlight: number, depth: number, workers: number }>,
    *   inFlightTasks: Array<{ uuid: string, group: string|null, attempts: number, startedAt: number, workerId: string, payload: any }>,
    * }>}
+   * @param {{ includePayload?: boolean }} [options] - includePayload attaches each in-flight task's payload to the result (default false, omitted to keep snapshots small and avoid leaking task data into observability output).
    */
   async snapshot({ includePayload = false } = {}) {
     const opts = this._options
@@ -252,15 +260,19 @@ export default class Queue extends EventEmitter {
     }
   }
 
-  /** @param {TaskHandler} handler */
+  /**
+   * Register the function that processes every task. Only one handler is active; calling this again replaces it.
+   * @param {TaskHandler} handler - invoked once per attempt with the payload, task, and an AbortSignal.
+   */
   process(handler) {
     this._handler = handler
   }
 
   /**
-   * @param {any} payload
-   * @param {{ group?: string }} [options]
-   * @returns {Promise<string>}
+   * Enqueue a task for processing and return immediately with its uuid.
+   * @param {any} payload - the value handed to the handler when the task runs.
+   * @param {{ group?: string }} [options] - group is the key that isolates this task's concurrency from other groups (omit for the default queue).
+   * @returns {Promise<string>} the task uuid, resolved once the task is durably enqueued in Redis.
    */
   async push(payload, { group } = {}) {
     if (this._closed) throw new Error("Queue is closed")
@@ -284,9 +296,10 @@ export default class Queue extends EventEmitter {
   }
 
   /**
-   * @param {any} payload
-   * @param {{ group?: string, timeout?: number|string }} [options]
-   * @returns {Promise<any>}
+   * Enqueue a task and resolve with its result once it completes, even if another instance processes it (delivered via Redis pub/sub with a durable key fallback, so delivery is at-least-once).
+   * @param {any} payload - the value handed to the handler when the task runs.
+   * @param {{ group?: string, timeout?: number|string }} [options] - group isolates this task's concurrency from other groups (omit for the default queue); timeout is how long to wait for a result before rejecting, as milliseconds or a duration string such as "30s" (default 0, wait forever). Retries are transparent, so a task that succeeds on a later attempt still resolves.
+   * @returns {Promise<any>} the value the handler returned, or a rejection if the task fails after retries are exhausted or the timeout is reached.
    */
   async pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) throw new Error("Queue is closed")
@@ -447,7 +460,10 @@ export default class Queue extends EventEmitter {
     return { promise, ready }
   }
 
-  /** @returns {Promise<void>} */
+  /**
+   * Stop accepting new tasks, wait briefly for in-flight tasks to settle, release any global concurrency leases, and disconnect every Redis client.
+   * @returns {Promise<void>}
+   */
   async close() {
     this._closed = true
     await this._readyPromise.catch(() => {})
