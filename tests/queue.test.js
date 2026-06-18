@@ -1111,6 +1111,62 @@ describe("Queue", () => {
     })
   })
 
+  describe("group worker recovery", () => {
+    it("respawns a group worker that broke while waiting on a global lease and drains the backlog", async () => {
+      queue = new Queue({ concurrency: 5, globalConcurrency: 1, groups: { concurrency: 1 }, cleanupInterval: 100 })
+
+      const processed = []
+      queue.process(async (payload) => { processed.push(payload.id) })
+
+      // force the first global-lease acquisition to fail exactly as a redis
+      // disconnect would: _acquireGlobal returns null, the worker re-pushes the
+      // task and breaks out of its loop, leaving the group with no live workers
+      const realAcquire = queue._acquireGlobal.bind(queue)
+      let forcedBreak = false
+      queue._acquireGlobal = async (workerId, activeMap) => {
+        if (!forcedBreak) { forcedBreak = true; return null }
+        return realAcquire(workerId, activeMap)
+      }
+
+      await queue.ready()
+
+      const done = waitForEvent(queue, "complete", 8000)
+      await queue.push({ id: "x" }, { group: "g1" })
+      await done
+
+      expect(forcedBreak).toBe(true)
+      expect(processed).toContain("x")
+    })
+
+    it("respawns workers for a group that is registered but has no live workers", async () => {
+      queue = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      const processed = []
+      queue.process(async (payload) => { processed.push(payload.id) })
+      await queue.ready()
+
+      // reproduce the wedged state a broken worker leaves behind: the group is
+      // still registered, has zero live workers, and a task sits in its backlog
+      queue._groupWorkers.set("g1", new Map())
+      queue._groupInFlight.set("g1", 0)
+      await redis.lPush("queue:groups:g1", JSON.stringify({
+        uuid: randomUUID(),
+        payload: { id: "stranded" },
+        createdAt: Date.now(),
+        group: "g1",
+        attempts: 0,
+      }))
+
+      // with cleanup disabled, a fresh push to the same group must respawn
+      // workers (via notify) and drain both the stranded and the new task
+      const both = waitForN(queue, "complete", 2)
+      await queue.push({ id: "new" }, { group: "g1" })
+      await both
+
+      expect(processed).toContain("stranded")
+      expect(processed).toContain("new")
+    })
+  })
+
   describe("groups.concurrency defaults", () => {
     it("should default groups.concurrency to 1 regardless of main concurrency", async () => {
       queue = new Queue({ concurrency: 5, cleanupInterval: 0 })

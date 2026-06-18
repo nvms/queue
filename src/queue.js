@@ -316,9 +316,13 @@ export default class Queue extends EventEmitter {
 
   /** @private */
   async _ensureGroupWorkers(group) {
-    if (this._groupWorkers.has(group) || this._closed || this._options.concurrency === 0) return
-    this._groupWorkers.set(group, new Map())
-    this._groupInFlight.set(group, 0)
+    if (this._closed || this._options.concurrency === 0) return
+    const existing = this._groupWorkers.get(group)
+    if (existing && existing.size > 0) return
+    if (!existing) {
+      this._groupWorkers.set(group, new Map())
+      this._groupInFlight.set(group, this._groupInFlight.get(group) ?? 0)
+    }
     await this._startGroupWorkers(group)
   }
 
@@ -496,7 +500,13 @@ export default class Queue extends EventEmitter {
 
   async _startWorker(workerId) {
     this._workers.set(workerId, true)
-    const client = await this._createWorkerClient()
+    let client
+    try {
+      client = await this._createWorkerClient()
+    } catch (err) {
+      this._workers.delete(workerId)
+      throw err
+    }
     const opts = {
       timeout: this._options.timeout,
       maxRetries: this._options.maxRetries,
@@ -507,7 +517,13 @@ export default class Queue extends EventEmitter {
 
   async _startGroupWorker(workerId, groupKey) {
     const groupWorkers = this._groupWorkers.get(groupKey)
-    const client = await this._createWorkerClient()
+    let client
+    try {
+      client = await this._createWorkerClient()
+    } catch (err) {
+      groupWorkers?.delete(workerId)
+      throw err
+    }
     const opts = {
       timeout: this._options.groups.timeout,
       maxRetries: this._options.groups.maxRetries,
@@ -576,6 +592,7 @@ export default class Queue extends EventEmitter {
         if (this._closed || !client.isOpen) break
       }
     }
+    activeMap.delete(workerId)
     if (client.isOpen) await client.disconnect().catch(() => {})
   }
 
@@ -722,13 +739,26 @@ export default class Queue extends EventEmitter {
     }, 0)
   }
 
+  _reviveDefaultWorkers() {
+    if (this._closed || this._options.concurrency === 0 || !this._redis.isOpen) return
+    for (let i = 0; i < this._options.concurrency; i++) {
+      const workerId = `worker-${i}`
+      if (!this._workers.get(workerId)) this._startWorker(workerId).catch(() => {})
+    }
+  }
+
   async _periodicCleanup() {
     try {
       if (!this._redis.isOpen) return
+      this._reviveDefaultWorkers()
       for (const groupKey of Array.from(this._groupWorkers.keys())) {
         if ((this._groupInFlight.get(groupKey) || 0) > 0) continue
         const length = await this._redis.lLen(`queue:groups:${groupKey}`)
-        if (length > 0) continue
+        if (length > 0) {
+          const groupWorkers = this._groupWorkers.get(groupKey)
+          if (!groupWorkers || groupWorkers.size === 0) await this._ensureGroupWorkers(groupKey)
+          continue
+        }
         if ((this._groupInFlight.get(groupKey) || 0) > 0) continue
         const groupWorkers = this._groupWorkers.get(groupKey)
         if (groupWorkers) {
