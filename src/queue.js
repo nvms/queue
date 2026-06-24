@@ -140,6 +140,9 @@ export default class Queue extends EventEmitter {
 
     this._redis = createClient(this._options.redisOptions)
     this._redis.on("error", () => {})
+    // annotated to keep @prsm/lock's internal semaphore type from leaking into
+    // the generated Queue declaration, which tsc cannot name portably (TS2742)
+    /** @type {any} */
     this._semaphore = this._options.globalConcurrency > 0
       ? createSemaphore({
           max: this._options.globalConcurrency,
