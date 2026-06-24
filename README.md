@@ -42,6 +42,7 @@ await queue.push({ userId: 123, action: 'sync' })
 
 ```js
 const queue = new Queue({
+  namespace: 'downloads',   // sub-scope for this queue's keys, nested under the "queue" root
   concurrency: 2,           // max concurrent tasks per instance
   globalConcurrency: 10,    // max concurrent tasks across all instances (Redis-backed)
   delay: '100ms',           // pause between tasks (string or ms)
@@ -97,6 +98,32 @@ const queue = new Queue({
 ```
 
 3 servers, each can handle 10 concurrent tasks, but only 20 total across all servers. Each group (tenant) gets up to 2 concurrent slots.
+
+## Multiple Queues
+
+Run several independent queues, each with its own concurrency, retry, and timeout policy, by giving each a distinct `namespace`. Every key a queue touches (tasks, groups, in-flight tracking, results, and the global concurrency budget) lives under the reserved `queue` root; the namespace nests beneath it, so two queues on the same Redis database never see each other's work.
+
+```js
+const downloads = new Queue({ namespace: 'downloads', concurrency: 2 })
+const llm = new Queue({ namespace: 'llm', concurrency: 10 })
+
+downloads.process(async ({ url, dest }, task, signal) => {
+  return await downloadFile(url, dest, signal)
+})
+
+llm.process(async ({ prompt }, task, signal) => {
+  return await callLLM(prompt, { signal })
+})
+
+await Promise.all([downloads.ready(), llm.ready()])
+
+await downloads.push({ url: '...', dest: '...' })
+await llm.push({ prompt: 'summarize this' })
+```
+
+Both queues run at the same time against one Redis connection target. Downloads stay capped at 2 concurrent transfers while the LLM queue runs up to 10, and a backlog in one never starves the other. Here the keys are `queue:downloads:*` and `queue:llm:*`. An unnamed queue keeps using the plain `queue:*` keys it always has.
+
+Because every key stays under the `queue` root, a namespace can never collide with another package's keyspace on the same Redis - `namespace: 'records'` keys under `queue:records:*`, not `records:*`. A namespace must be a non-empty string of letters, digits, dot, colon, underscore, or dash. Each distinct concurrency policy is one queue, one namespace; if every job type can share the same limits, prefer a single queue and branch inside the handler on a field in the payload.
 
 ## Process Handler
 

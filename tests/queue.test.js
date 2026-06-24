@@ -1401,4 +1401,138 @@ describe("Queue", () => {
       await q.close().catch(() => {})
     })
   })
+
+  describe("namespace", () => {
+    it("should key tasks under the plain queue root by default", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      await queue.push({ message: "test" })
+
+      expect(await redis.lLen("queue:tasks")).toBe(1)
+      const snap = await queue.snapshot()
+      expect(snap.options.namespace).toBe(null)
+      expect(snap.options.keyPrefix).toBe("queue")
+    })
+
+    it("should nest a custom namespace under the queue root", async () => {
+      queue = new Queue({ namespace: "downloads", concurrency: 0 })
+      await queue.ready()
+
+      await queue.push({ url: "a" })
+      await queue.push({ url: "b" }, { group: "tenant-1" })
+
+      expect(await redis.lLen("queue:downloads:tasks")).toBe(1)
+      expect(await redis.lLen("queue:downloads:groups:tenant-1")).toBe(1)
+      expect(await redis.lLen("queue:tasks")).toBe(0)
+      expect(await redis.lLen("downloads:tasks")).toBe(0)
+      const snap = await queue.snapshot()
+      expect(snap.options.namespace).toBe("downloads")
+      expect(snap.options.keyPrefix).toBe("queue:downloads")
+    })
+
+    it("should keep a namespace from escaping the queue root", async () => {
+      queue = new Queue({ namespace: "records", concurrency: 0 })
+      await queue.ready()
+
+      await queue.push({ id: 1 })
+
+      // a sibling package owning the "records:*" keyspace stays untouched
+      expect(await redis.lLen("records:tasks")).toBe(0)
+      expect(await redis.lLen("queue:records:tasks")).toBe(1)
+    })
+
+    it("should not let two namespaced queues steal each other's tasks", async () => {
+      const downloads = new Queue({ namespace: "downloads", concurrency: 2 })
+      const llm = new Queue({ namespace: "llm", concurrency: 2 })
+      extraQueues.push(downloads, llm)
+
+      const downloadSeen = []
+      const llmSeen = []
+      downloads.process(async (p) => { downloadSeen.push(p.kind); return p })
+      llm.process(async (p) => { llmSeen.push(p.kind); return p })
+
+      await Promise.all([downloads.ready(), llm.ready()])
+
+      const downloadDone = waitForSettled(downloads, 3)
+      const llmDone = waitForSettled(llm, 2)
+
+      await downloads.push({ kind: "download" })
+      await downloads.push({ kind: "download" })
+      await downloads.push({ kind: "download" })
+      await llm.push({ kind: "llm" })
+      await llm.push({ kind: "llm" })
+
+      await Promise.all([downloadDone, llmDone])
+
+      expect(downloadSeen).toEqual(["download", "download", "download"])
+      expect(llmSeen).toEqual(["llm", "llm"])
+    })
+
+    it("should enforce independent concurrency limits per namespace", async () => {
+      const slow = new Queue({ namespace: "slow", concurrency: 2 })
+      const fast = new Queue({ namespace: "fast", concurrency: 5 })
+      extraQueues.push(slow, fast)
+
+      let slowActive = 0
+      let slowPeak = 0
+      let fastActive = 0
+      let fastPeak = 0
+      const gate = () => new Promise((r) => setTimeout(r, 50))
+
+      slow.process(async () => { slowActive++; slowPeak = Math.max(slowPeak, slowActive); await gate(); slowActive-- })
+      fast.process(async () => { fastActive++; fastPeak = Math.max(fastPeak, fastActive); await gate(); fastActive-- })
+
+      await Promise.all([slow.ready(), fast.ready()])
+
+      const slowDone = waitForSettled(slow, 6)
+      const fastDone = waitForSettled(fast, 10)
+      for (let i = 0; i < 6; i++) await slow.push({ i })
+      for (let i = 0; i < 10; i++) await fast.push({ i })
+      await Promise.all([slowDone, fastDone])
+
+      expect(slowPeak).toBeLessThanOrEqual(2)
+      expect(fastPeak).toBeLessThanOrEqual(5)
+      expect(fastPeak).toBeGreaterThan(2)
+    })
+
+    it("should isolate groups across namespaces", async () => {
+      const a = new Queue({ namespace: "ns-a", concurrency: 5, groups: { concurrency: 1 } })
+      const b = new Queue({ namespace: "ns-b", concurrency: 5, groups: { concurrency: 1 } })
+      extraQueues.push(a, b)
+
+      const aSeen = []
+      const bSeen = []
+      a.process(async (p) => { aSeen.push(p.v); return p })
+      b.process(async (p) => { bSeen.push(p.v); return p })
+
+      await Promise.all([a.ready(), b.ready()])
+
+      const aDone = waitForSettled(a, 2)
+      const bDone = waitForSettled(b, 1)
+      await a.push({ v: "a1" }, { group: "shared" })
+      await a.push({ v: "a2" }, { group: "shared" })
+      await b.push({ v: "b1" }, { group: "shared" })
+      await Promise.all([aDone, bDone])
+
+      expect(aSeen.sort()).toEqual(["a1", "a2"])
+      expect(bSeen).toEqual(["b1"])
+    })
+
+    it("should deliver pushAndWait results under a custom namespace", async () => {
+      queue = new Queue({ namespace: "rpc", concurrency: 2 })
+      queue.process(async (p) => ({ doubled: p.n * 2 }))
+      await queue.ready()
+
+      const result = await queue.pushAndWait({ n: 21 }, { timeout: "5s" })
+      expect(result).toEqual({ doubled: 42 })
+    })
+
+    it("should reject invalid namespaces", () => {
+      expect(() => new Queue({ namespace: "" })).toThrow(/namespace/i)
+      expect(() => new Queue({ namespace: "has space" })).toThrow(/namespace/i)
+      expect(() => new Queue({ namespace: "glob*" })).toThrow(/namespace/i)
+      expect(() => new Queue({ namespace: 123 })).toThrow(/namespace/i)
+    })
+  })
 })

@@ -12,6 +12,7 @@ import { semaphore as createSemaphore } from "@prsm/lock"
  * @property {number|string} [timeout] - maximum time a single task may run before it is aborted and treated as a failed attempt, as milliseconds or a duration string such as "30s" (default 0, no limit). When it fires, the AbortSignal passed to the handler is aborted so cancellation-aware work stops instead of running detached during the retry.
  * @property {number} [maxRetries] - total number of attempts allowed before a task fails permanently, counting the first try (default 3). A handler that throws is retried until this count is reached, after which the "failed" event fires.
  * @property {{concurrency?: number, delay?: number|string, timeout?: number|string, maxRetries?: number}} [groups] - per-group overrides applied to grouped tasks. concurrency is the limit within a single group (default 1); delay, timeout, and maxRetries fall back to the top-level values when omitted. The top-level concurrency still caps total in-flight tasks on this instance, so groups partition that budget rather than adding to it.
+ * @property {string} [namespace] - sub-scope for every Redis key and pub/sub channel this queue uses. All keys live under the reserved "queue" root; a namespace nests beneath it, so "downloads" keys tasks under "queue:downloads:tasks" while the default (omitted) keeps the plain "queue:tasks". Give two queues distinct namespaces to run them independently on the same Redis database, each with its own tasks, groups, in-flight tracking, results, and global concurrency budget, with no risk of colliding with another package's keyspace. Must be a non-empty string of letters, digits, dot, colon, underscore, or dash.
  * @property {{url?: string, host?: string, port?: number, password?: string}} [redisOptions] - connection options passed to the node-redis client. Provide either a url or discrete host/port/password fields (defaults to redis on localhost:6379).
  * @property {number} [cleanupInterval] - interval in milliseconds at which idle, empty group workers are torn down and dropped default workers are revived (default 30000, 0 to disable). The timer is unref'd so it does not keep the process alive on its own.
  * @property {number|string} [connectTimeout] - maximum time to wait for the initial Redis connection before ready() rejects, as milliseconds or a duration string such as "10s" (default "10s", 0 to wait forever). This bounds startup: node-redis retries a refused connection indefinitely, so without a deadline ready() would hang when Redis is down. It applies only to the initial connect; once connected the client uses Redis's default reconnect behavior to ride out transient outages.
@@ -35,6 +36,23 @@ import { semaphore as createSemaphore } from "@prsm/lock"
  * @param {AbortSignal} signal - aborts when the per-task timeout fires; also available as task.signal. Pass it to anything that supports cancellation so the work stops instead of running detached while a retry begins.
  * @returns {Promise<any>|any}
  */
+
+const NAMESPACE_PATTERN = /^[A-Za-z0-9._:-]+$/
+
+// every key lives under the reserved "queue" root so a namespace can isolate
+// one queue from another but can never escape into a sibling package's keyspace
+function buildKeys(prefix) {
+  return {
+    tasks: `${prefix}:tasks`,
+    active: `${prefix}:active`,
+    groupNotify: `${prefix}:group:notify`,
+    groupPrefix: `${prefix}:groups:`,
+    inflightMatch: `${prefix}:inflight:*`,
+    group: (name) => `${prefix}:groups:${name}`,
+    inflight: (uuid) => `${prefix}:inflight:${uuid}`,
+    result: (uuid) => `${prefix}:result:${uuid}`,
+  }
+}
 
 const LEASE_TTL = 60000
 const HEARTBEAT_INTERVAL = 15000
@@ -76,7 +94,16 @@ export default class Queue extends EventEmitter {
   constructor(options = {}) {
     super()
 
+    const namespace = options.namespace
+    if (namespace !== undefined && (typeof namespace !== "string" || !NAMESPACE_PATTERN.test(namespace))) {
+      throw new Error(`Invalid namespace: ${JSON.stringify(namespace)} (must be a non-empty string of letters, digits, dot, colon, underscore, or dash)`)
+    }
+    const keyPrefix = namespace === undefined ? "queue" : `queue:${namespace}`
+    this._keys = buildKeys(keyPrefix)
+
     this._options = {
+      namespace: namespace ?? null,
+      keyPrefix,
       concurrency: options.concurrency ?? 1,
       globalConcurrency: options.globalConcurrency ?? 0,
       delay: ms(options.delay ?? 0),
@@ -172,11 +199,11 @@ export default class Queue extends EventEmitter {
     const groupDepths = new Map()
     if (this._redis?.isOpen) {
       try {
-        defaultDepth = await this._redis.lLen('queue:tasks')
+        defaultDepth = await this._redis.lLen(this._keys.tasks)
       } catch {}
       for (const name of groupNames) {
         try {
-          groupDepths.set(name, await this._redis.lLen(`queue:groups:${name}`))
+          groupDepths.set(name, await this._redis.lLen(this._keys.group(name)))
         } catch {
           groupDepths.set(name, 0)
         }
@@ -208,7 +235,7 @@ export default class Queue extends EventEmitter {
     if (this._redis?.isOpen) {
       try {
         const keys = []
-        for await (const batch of this._redis.scanIterator({ MATCH: 'queue:inflight:*', COUNT: 100 })) {
+        for await (const batch of this._redis.scanIterator({ MATCH: this._keys.inflightMatch, COUNT: 100 })) {
           if (Array.isArray(batch)) keys.push(...batch)
           else keys.push(batch)
         }
@@ -241,6 +268,8 @@ export default class Queue extends EventEmitter {
 
     return {
       options: {
+        namespace: opts.namespace,
+        keyPrefix: opts.keyPrefix,
         concurrency: opts.concurrency,
         globalConcurrency: opts.globalConcurrency,
         delay: opts.delay,
@@ -328,11 +357,11 @@ export default class Queue extends EventEmitter {
   /** @private */
   async _enqueue(task, group) {
     if (group) {
-      await this._redis.lPush(`queue:groups:${group}`, JSON.stringify(task))
+      await this._redis.lPush(this._keys.group(group), JSON.stringify(task))
       await this._ensureGroupWorkers(group)
-      this._redis.publish("queue:group:notify", group).catch(() => {})
+      this._redis.publish(this._keys.groupNotify, group).catch(() => {})
     } else {
-      await this._redis.lPush("queue:tasks", JSON.stringify(task))
+      await this._redis.lPush(this._keys.tasks, JSON.stringify(task))
     }
   }
 
@@ -387,7 +416,7 @@ export default class Queue extends EventEmitter {
   /** @private */
   _awaitTask(uuid, timeout = 0) {
     const ms_ = ms(timeout)
-    const channel = `queue:result:${uuid}`
+    const channel = this._keys.result(uuid)
     let resolveReady
 
     const ready = new Promise((r) => { resolveReady = r })
@@ -512,7 +541,7 @@ export default class Queue extends EventEmitter {
 
   async _initialize() {
     await this._connectWithDeadline(this._redis, "main")
-    if (this._semaphore) await this._semaphore.peek("queue:active").catch(() => {})
+    if (this._semaphore) await this._semaphore.peek(this._keys.active).catch(() => {})
     await this._startWorkers()
     if (this._options.concurrency > 0) {
       await this._subscribeToGroupNotifications()
@@ -528,15 +557,15 @@ export default class Queue extends EventEmitter {
     this._groupNotifyClient = this._redis.duplicate()
     this._groupNotifyClient.on("error", () => {})
     await this._connectWithDeadline(this._groupNotifyClient, "notify")
-    await this._groupNotifyClient.subscribe("queue:group:notify", (group) => {
+    await this._groupNotifyClient.subscribe(this._keys.groupNotify, (group) => {
       this._ensureGroupWorkers(group)
     })
   }
 
   async _discoverExistingGroups() {
-    const keys = await this._redis.keys("queue:groups:*")
+    const keys = await this._redis.keys(`${this._keys.groupPrefix}*`)
     for (const key of keys) {
-      const group = key.slice("queue:groups:".length)
+      const group = key.slice(this._keys.groupPrefix.length)
       await this._ensureGroupWorkers(group)
     }
   }
@@ -580,9 +609,9 @@ export default class Queue extends EventEmitter {
     const opts = {
       timeout: this._options.timeout,
       maxRetries: this._options.maxRetries,
-      retryKey: "queue:tasks",
+      retryKey: this._keys.tasks,
     }
-    this._runWorkerLoop(workerId, client, "queue:tasks", this._workers, opts)
+    this._runWorkerLoop(workerId, client, this._keys.tasks, this._workers, opts)
   }
 
   async _startGroupWorker(workerId, groupKey) {
@@ -597,10 +626,10 @@ export default class Queue extends EventEmitter {
     const opts = {
       timeout: this._options.groups.timeout,
       maxRetries: this._options.groups.maxRetries,
-      retryKey: `queue:groups:${groupKey}`,
+      retryKey: this._keys.group(groupKey),
       group: groupKey,
     }
-    this._runWorkerLoop(workerId, client, `queue:groups:${groupKey}`, groupWorkers, opts)
+    this._runWorkerLoop(workerId, client, this._keys.group(groupKey), groupWorkers, opts)
   }
 
   async _runWorkerLoop(workerId, client, key, activeMap, opts) {
@@ -669,7 +698,7 @@ export default class Queue extends EventEmitter {
   async _acquireGlobal(workerId, activeMap) {
     while (activeMap.get(workerId) && !this._closed) {
       if (!this._redis.isOpen) return null
-      const result = await this._semaphore.acquire("queue:active")
+      const result = await this._semaphore.acquire(this._keys.active)
       if (result.acquired) {
         const leaseId = result.id
         this._activeLeases.add(leaseId)
@@ -690,11 +719,11 @@ export default class Queue extends EventEmitter {
       clearInterval(heartbeat)
       this._heartbeats.delete(leaseId)
     }
-    await this._semaphore.release("queue:active", leaseId).catch(() => {})
+    await this._semaphore.release(this._keys.active, leaseId).catch(() => {})
   }
 
   async _renewGlobal(leaseId) {
-    await this._semaphore.renew("queue:active", leaseId).catch(() => {})
+    await this._semaphore.renew(this._keys.active, leaseId).catch(() => {})
   }
 
   async _processTask(task, opts) {
@@ -780,7 +809,7 @@ export default class Queue extends EventEmitter {
     const ttlMs = Math.max(60_000, (timeoutMs || 0) * 2)
     try {
       await this._redis.set(
-        `queue:inflight:${task.uuid}`,
+        this._keys.inflight(task.uuid),
         JSON.stringify({
           uuid: task.uuid,
           payload: task.payload,
@@ -798,7 +827,7 @@ export default class Queue extends EventEmitter {
 
   async _clearInflightRemote(uuid) {
     if (!this._redis?.isOpen) return
-    try { await this._redis.del(`queue:inflight:${uuid}`) } catch {}
+    try { await this._redis.del(this._keys.inflight(uuid)) } catch {}
   }
 
   // pub/sub is at-most-once: a waiter on another instance loses the result if
@@ -806,7 +835,7 @@ export default class Queue extends EventEmitter {
   // key the waiter can read, making delivery at-least-once
   _publishResult(task, payload) {
     if (!this._redis.isOpen) return
-    const key = `queue:result:${task.uuid}`
+    const key = this._keys.result(task.uuid)
     const data = JSON.stringify(payload)
     this._redis.publish(key, data).catch(() => {})
     if (task.awaitResult) this._redis.set(key, data, { PX: RESULT_TTL }).catch(() => {})
@@ -838,7 +867,7 @@ export default class Queue extends EventEmitter {
       this._reviveDefaultWorkers()
       for (const groupKey of Array.from(this._groupWorkers.keys())) {
         if ((this._groupInFlight.get(groupKey) || 0) > 0) continue
-        const length = await this._redis.lLen(`queue:groups:${groupKey}`)
+        const length = await this._redis.lLen(this._keys.group(groupKey))
         if (length > 0) {
           const groupWorkers = this._groupWorkers.get(groupKey)
           if (!groupWorkers || groupWorkers.size === 0) await this._ensureGroupWorkers(groupKey)
