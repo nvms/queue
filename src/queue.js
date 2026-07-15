@@ -4,6 +4,13 @@ import { randomUUID } from "crypto"
 import ms from "@prsm/ms"
 import { semaphore as createSemaphore } from "@prsm/lock"
 
+// node-redis only reads host/port from the nested socket object and silently
+// ignores them at the top level, so lift the documented flat fields into place
+function toClientOptions({ host, port, ...rest } = {}) {
+  if (rest.url || (host === undefined && port === undefined)) return rest
+  return { ...rest, socket: { host: host ?? "127.0.0.1", port: port ?? 6379, ...rest.socket } }
+}
+
 /**
  * @typedef {Object} QueueOptions
  * @property {number} [concurrency] - maximum number of tasks this instance processes at once across both the default queue and all groups, enforced by an in-memory semaphore (default 1). This is also the number of worker loops created for the default queue. Set to 0 to make this instance push-only, enqueuing tasks without processing any.
@@ -138,7 +145,7 @@ export default class Queue extends EventEmitter {
     this._activeLeases = new Set()
     this._heartbeats = new Map()
 
-    this._redis = createClient(this._options.redisOptions)
+    this._redis = createClient(toClientOptions(this._options.redisOptions))
     this._redis.on("error", () => {})
     // annotated to keep @prsm/lock's internal semaphore type from leaking into
     // the generated Queue declaration, which tsc cannot name portably (TS2742)
@@ -147,7 +154,7 @@ export default class Queue extends EventEmitter {
       ? createSemaphore({
           max: this._options.globalConcurrency,
           ttl: LEASE_TTL,
-          redis: this._options.redisOptions,
+          redis: toClientOptions(this._options.redisOptions),
           prefix: "",
         })
       : null
