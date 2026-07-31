@@ -139,6 +139,7 @@ export default class Queue extends EventEmitter {
     this._pushed = 0
     this._totalSettled = 0
     this._inFlightTasks = new Map()
+    this._resultWaiters = new Map()
     this._instanceId = randomUUID()
     this._closed = false
     this._localSemaphore = new LocalSemaphore(this._options.concurrency)
@@ -448,14 +449,11 @@ export default class Queue extends EventEmitter {
         else settle(reject, error ? Object.assign(new Error(error.message), error) : new Error("Task failed"))
       }
 
-      const onLocal = (event) => ({ task, result, error }) => {
-        if (task.uuid !== uuid) return
-        if (event === "complete") settle(resolve, result)
+      const onLocal = ({ status, result, error }) => {
+        if (status === "complete") settle(resolve, result)
         else settle(reject, error)
       }
-
-      const onComplete = onLocal("complete")
-      const onFailed = onLocal("failed")
+      this._resultWaiters.set(uuid, onLocal)
 
       // safety net for a dropped pub/sub message: read the durable result key
       const consumeDurable = async () => {
@@ -469,8 +467,7 @@ export default class Queue extends EventEmitter {
       const cleanup = () => {
         if (timer) clearTimeout(timer)
         if (pollTimer) clearInterval(pollTimer)
-        this.off("complete", onComplete)
-        this.off("failed", onFailed)
+        this._resultWaiters.delete(uuid)
         this._subClient?.unsubscribe(channel).catch(() => {})
         this._redis?.del(channel).catch(() => {})
       }
@@ -484,9 +481,6 @@ export default class Queue extends EventEmitter {
 
       pollTimer = setInterval(() => { consumeDurable() }, RESULT_POLL_INTERVAL)
       pollTimer.unref?.()
-
-      this.on("complete", onComplete)
-      this.on("failed", onFailed)
 
       this._ensureSubClient().then((sub) => {
         if (settled) { resolveReady(); return }
@@ -791,6 +785,7 @@ export default class Queue extends EventEmitter {
     if (succeeded) {
       this._settle()
       this._publishResult(task, { status: "complete", result })
+      this._resultWaiters.get(task.uuid)?.({ status: "complete", result })
       try { this.emit("complete", { task, result }) } finally { this._emitDrain() }
     } else if (task.attempts < opts.maxRetries && !this._closed) {
       let retried = false
@@ -804,11 +799,13 @@ export default class Queue extends EventEmitter {
       } else {
         this._settle()
         this._publishResult(task, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
+        this._resultWaiters.get(task.uuid)?.({ status: "failed", error: handlerError })
         try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
       }
     } else {
       this._settle()
       this._publishResult(task, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
+      this._resultWaiters.get(task.uuid)?.({ status: "failed", error: handlerError })
       try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
     }
   }
