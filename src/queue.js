@@ -3,6 +3,7 @@ import { EventEmitter } from "events"
 import { randomUUID } from "crypto"
 import ms from "@prsm/ms"
 import { semaphore as createSemaphore } from "@prsm/lock"
+import { createWindow } from "./window.js"
 
 // node-redis only reads host/port from the nested socket object and silently
 // ignores them at the top level, so lift the documented flat fields into place
@@ -24,6 +25,8 @@ function toClientOptions({ host, port, ...rest } = {}) {
  * @property {number} [cleanupInterval] - interval in milliseconds at which idle, empty group workers are torn down and dropped default workers are revived (default 30000, 0 to disable). The timer is unref'd so it does not keep the process alive on its own.
  * @property {number|string} [connectTimeout] - maximum time to wait for the initial Redis connection before ready() rejects, as milliseconds or a duration string such as "10s" (default "10s", 0 to wait forever). This bounds startup: node-redis retries a refused connection indefinitely, so without a deadline ready() would hang when Redis is down. It applies only to the initial connect; once connected the client uses Redis's default reconnect behavior to ride out transient outages.
  * @property {object} [tracer] - optional @prsm/trace tracer; when provided, push, pushAndWait, and task processing emit spans (default none).
+ * @property {import("./window.js").TimeWindow|import("./window.js").WindowPredicate} [window] - when workers may start tasks (default: always). Give a wall-clock span such as { from: "00:00", to: "05:00" } or a predicate returning true while work is allowed. Outside the window workers sleep instead of pulling tasks; push() keeps accepting tasks and a task already running is never interrupted. The window is evaluated per instance, so different instances may use different windows.
+ * @property {number|string} [windowInterval] - how often a predicate window is re-evaluated while it reports closed, as milliseconds or a duration string (default "5s"). A wall-clock window ignores this and sleeps until its next boundary.
  */
 
 /**
@@ -66,6 +69,7 @@ const HEARTBEAT_INTERVAL = 15000
 const CLOSE_TIMEOUT = 5000
 const RESULT_TTL = 60000
 const RESULT_POLL_INTERVAL = 1000
+const GATE_MAX_SLEEP = 60000
 
 class LocalSemaphore {
   constructor(max) {
@@ -125,7 +129,12 @@ export default class Queue extends EventEmitter {
       redisOptions: options.redisOptions ?? {},
       cleanupInterval: options.cleanupInterval ?? 30000,
       connectTimeout: ms(options.connectTimeout ?? "10s"),
+      windowInterval: ms(options.windowInterval ?? "5s"),
     }
+    this._window = createWindow(options.window, this._options.windowInterval)
+    this._paused = false
+    this._active = true
+    this._gateWaiters = new Set()
 
     this._tracer = options.tracer ?? null
     this._handler = null
@@ -176,6 +185,42 @@ export default class Queue extends EventEmitter {
   }
 
   /**
+   * Stop workers from starting new tasks until resume() is called. Running tasks finish normally and push() keeps working.
+   */
+  pause() {
+    if (this._paused) return
+    this._paused = true
+    this._setActive(false)
+    this._wakeGateWaiters()
+  }
+
+  /**
+   * Allow workers to start tasks again after pause(). A configured window still applies.
+   */
+  resume() {
+    if (!this._paused) return
+    this._paused = false
+    if (!this._window) this._setActive(true)
+    this._wakeGateWaiters()
+  }
+
+  /**
+   * True after pause() and until resume(). Independent of the window.
+   * @returns {boolean}
+   */
+  get paused() {
+    return this._paused
+  }
+
+  /**
+   * True while workers on this instance may start tasks: not paused and inside the window.
+   * @returns {boolean}
+   */
+  get active() {
+    return this._active
+  }
+
+  /**
    * Number of tasks this instance is processing right now, across the default queue and all groups.
    * @returns {number}
    */
@@ -188,6 +233,9 @@ export default class Queue extends EventEmitter {
    * Safe to call from observability/devtools - hits Redis with LLEN per known group.
    * @returns {Promise<{
    *   options: object,
+   *   paused: boolean,
+   *   active: boolean,
+   *   window: { type: string, from?: string, to?: string, tz?: string|null } | null,
    *   inFlight: number,
    *   defaultInFlight: number,
    *   pushed: number,
@@ -287,8 +335,12 @@ export default class Queue extends EventEmitter {
         timeout: opts.timeout,
         maxRetries: opts.maxRetries,
         groups: { ...opts.groups },
+        windowInterval: opts.windowInterval,
       },
       instanceId: this._instanceId,
+      paused: this._paused,
+      active: this._active,
+      window: this._window ? this._window.describe() : null,
       inFlight: this._inFlight,
       defaultInFlight: this._defaultInFlight,
       pushed: this._pushed,
@@ -509,6 +561,7 @@ export default class Queue extends EventEmitter {
     this._groupWorkers.clear()
 
     this._localSemaphore.releaseAll()
+    this._wakeGateWaiters()
 
     if (this._inFlight > 0) {
       await Promise.race([
@@ -642,8 +695,16 @@ export default class Queue extends EventEmitter {
     while (activeMap.get(workerId)) {
       try {
         if (!client.isOpen) break
+        if (!(await this._waitForGate(workerId, activeMap))) continue
         const taskData = await client.brPop(key, 1)
         if (!taskData) continue
+
+        // the gate can close while brPop is blocking, so hand the task back
+        // to the front of the list rather than start it late
+        if (this._paused || !(await this._isWindowOpen())) {
+          await this._redis.rPush(key, taskData.element).catch(() => {})
+          continue
+        }
 
         const task = JSON.parse(taskData.element)
 
@@ -697,6 +758,49 @@ export default class Queue extends EventEmitter {
     }
     activeMap.delete(workerId)
     if (client.isOpen) await client.disconnect().catch(() => {})
+  }
+
+  async _isWindowOpen() {
+    if (!this._window) return true
+    try {
+      return Boolean(await this._window.isOpen())
+    } catch {
+      return false
+    }
+  }
+
+  _setActive(active) {
+    if (this._active === active) return
+    this._active = active
+    this.emit(active ? "resume" : "pause")
+  }
+
+  _wakeGateWaiters() {
+    for (const wake of this._gateWaiters) wake()
+    this._gateWaiters.clear()
+  }
+
+  _sleepForGate(delay) {
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer)
+        this._gateWaiters.delete(wake)
+        resolve()
+      }
+      const timer = delay === null ? null : setTimeout(wake, delay)
+      this._gateWaiters.add(wake)
+    })
+  }
+
+  async _waitForGate(workerId, activeMap) {
+    while (activeMap.get(workerId) && !this._closed) {
+      const open = !this._paused && (await this._isWindowOpen())
+      this._setActive(open)
+      if (open) return true
+      const delay = this._paused && !this._window ? null : Math.min(this._window?.msUntilChange() ?? this._options.windowInterval, GATE_MAX_SLEEP)
+      await this._sleepForGate(delay)
+    }
+    return false
   }
 
   async _acquireGlobal(workerId, activeMap) {

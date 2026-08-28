@@ -49,6 +49,8 @@ const queue = new Queue({
   timeout: '30s',           // max task duration
   maxRetries: 3,            // attempts before failing
   connectTimeout: '10s',    // max wait for the initial Redis connection (string or ms)
+  window: { from: '00:00', to: '05:00' },  // when workers may start tasks (see Window)
+  windowInterval: '5s',     // how often a predicate window is re-checked while closed
 
   groups: {
     concurrency: 1,         // max concurrent tasks per group
@@ -98,6 +100,37 @@ const queue = new Queue({
 ```
 
 3 servers, each can handle 10 concurrent tasks, but only 20 total across all servers. Each group (tenant) gets up to 2 concurrent slots.
+
+## Window
+
+`window` limits when workers on this instance may start tasks. Tasks pushed outside the window wait in Redis until it opens, and a task already running always finishes.
+
+A wall-clock span, read in the process time zone unless `tz` is given. `to` earlier than `from` spans midnight.
+
+```js
+const queue = new Queue({
+  concurrency: 1,
+  delay: '30s',
+  window: { from: '00:00', to: '05:00', tz: 'America/Chicago' }
+})
+```
+
+A predicate, re-evaluated before every task and every `windowInterval` while it reports closed. Throwing counts as closed.
+
+```js
+const queue = new Queue({
+  window: () => !mediaServer.isStreaming(),
+  windowInterval: '10s'
+})
+```
+
+`pause()` and `resume()` do the same thing by hand and combine with the window: a paused queue never starts tasks, and a resumed one still waits for the window. `queue.paused` reports the manual flag, `queue.active` reports whether workers may currently start tasks, and `pause` / `resume` events fire when `active` changes.
+
+```js
+queue.pause()
+queue.on('resume', () => console.log('workers running'))
+queue.resume()
+```
 
 ## Multiple Queues
 
@@ -198,6 +231,8 @@ queue.on('complete', ({ task, result }) => {})
 queue.on('retry', ({ task, error, attempt }) => {})
 queue.on('failed', ({ task, error }) => {})
 queue.on('drain', () => {})
+queue.on('pause', () => {})
+queue.on('resume', () => {})
 ```
 
 ## Task Object

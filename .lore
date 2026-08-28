@@ -5,3 +5,5 @@ processed the task. in a multi-instance deployment, only the server that
 ran the task emits the event. if you need cross-instance notification,
 use redis pub/sub or @prsm/realtime broadcasting from within the event
 handler.
+
+The test suite needs exclusive use of localhost:6379. Any running app that consumes the default queue namespace (e.g. another project's dev server connected to a redis published on 6379) steals tasks pushed by the tests, and most of the suite fails with "timed out waiting for X event" errors. Check for other consumers with CLIENT LIST or lsof before trusting test failures.
